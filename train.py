@@ -9,7 +9,7 @@ import torch.nn.functional as F
 from torch.cuda.amp import GradScaler, autocast
 from torch.utils.data import DataLoader, Dataset
 
-from models import HSIVAE
+from models.HSI_VAE import HSIVAE
 
 # Change these imports to match your loss files.
 from loss.vae_losses import reconstruction_loss,kl_divergence_loss
