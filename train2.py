@@ -1039,23 +1039,15 @@ def train_one_epoch(
             print(
                 f"Batch {batch_index:03d}/{len(loader):03d} | "
                 f"  Train | "
-                f"Total: {training_metrics['loss']:.8f} | "
-                f"MSE: {training_metrics['rgb_mse']:.8f} | "
-                f"MAE: {training_metrics['rgb_mae']:.6f} | "
-                f"MRAE: {training_metrics['mrae']:.6f} | "
-                f"RMSE: {training_metrics['rmse']:.6f} | "
-                f"SAM: {training_metrics['sam']:.6f} | "
-                f"PSNR: {training_metrics['custom_psnr']:.3f} | "
-                f"SSIM: {training_metrics['ssim']:.6f}\n"
-                f"  Val   | "
-                f"Total: {validation_metrics['loss']:.8f} | "
-                f"MSE: {validation_metrics['rgb_mse']:.8f} | "
-                f"MAE: {validation_metrics['rgb_mae']:.6f} | "
-                f"MRAE: {validation_metrics['mrae']:.6f} | "
-                f"RMSE: {validation_metrics['rmse']:.6f} | "
-                f"SAM: {validation_metrics['sam']:.6f} | "
-                f"PSNR: {validation_metrics['custom_psnr']:.3f} | "
-                f"SSIM: {validation_metrics['ssim']:.6f}"
+                f"Total: {totals['loss']:.8f} | "
+                f"MSE: {totals['rgb_mse']:.8f} | "
+                f"MAE: {totals['rgb_mae']:.6f} | "
+                f"MRAE: {totals['mrae']:.6f} | "
+                f"RMSE: {totals['rmse']:.6f} | "
+                f"SAM: {totals['sam']:.6f} | "
+                f"PSNR: {totals['custom_psnr']:.3f} | "
+                f"SSIM: {totals['ssim']:.6f}\n"
+                
             )
 
     return {key: value / total_samples for key, value in totals.items()}
