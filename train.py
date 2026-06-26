@@ -1,4 +1,5 @@
 import random
+import hashlib
 from pathlib import Path
 from typing import List
 import h5py
@@ -26,6 +27,9 @@ from loss.ssim import ssim
 
 DATA_DIR = "/kaggle/input/datasets/sriramhari14/ntire-2022/Train_spectral"
 OUTPUT_DIR = "./vae_checkpoints"
+
+HSI_KEY = "cube"
+VALIDATION_CACHE = Path(OUTPUT_DIR) / "hsi_validation_cache.pth"
 
 HSI_CHANNELS = 31
 PATCH_SIZE = 64
@@ -134,11 +138,226 @@ def load_mat_v73(file_path: Path) -> np.ndarray:
 
     return cube
 
+def make_files_fingerprint(
+    files: List[Path],
+) -> str:
+    """
+    Create a fingerprint from file paths, sizes, and modification times.
+
+    The cached validation result is reused only when this fingerprint matches.
+    """
+    records = []
+
+    for file_path in files:
+        stat = file_path.stat()
+
+        records.append(
+            f"{file_path.resolve()}|"
+            f"{stat.st_size}|"
+            f"{stat.st_mtime_ns}"
+        )
+
+    fingerprint_text = "\n".join(records)
+
+    return hashlib.sha256(
+        fingerprint_text.encode("utf-8")
+    ).hexdigest()
+
+
+def is_possible_hsi_shape(
+    shape,
+    hsi_channels: int,
+) -> bool:
+    """
+    Check whether a shape can represent a three-dimensional HSI cube.
+    """
+    return (
+        len(shape) == 3
+        and hsi_channels in shape
+        and all(int(size) > 0 for size in shape)
+    )
+
+
+def inspect_hdf5_mat_file(
+    file_path: Path,
+    hsi_channels: int,
+    hsi_key: str,
+) -> None:
+    """
+    Inspect MATLAB v7.3 metadata without loading the full cube.
+
+    Opening the HDF5 container also detects truncated files.
+    """
+    candidates = []
+
+    with h5py.File(str(file_path), "r") as h5_file:
+        if (
+            hsi_key in h5_file
+            and isinstance(h5_file[hsi_key], h5py.Dataset)
+        ):
+            dataset = h5_file[hsi_key]
+
+            candidates.append(
+                (
+                    hsi_key,
+                    tuple(int(value) for value in dataset.shape),
+                )
+            )
+
+        else:
+            def visitor(name, obj):
+                if not isinstance(obj, h5py.Dataset):
+                    return
+
+                if obj.ndim != 3:
+                    return
+
+                try:
+                    is_numeric = np.issubdtype(
+                        obj.dtype,
+                        np.number,
+                    )
+                except TypeError:
+                    is_numeric = False
+
+                if is_numeric:
+                    candidates.append(
+                        (
+                            name,
+                            tuple(int(value) for value in obj.shape),
+                        )
+                    )
+
+            h5_file.visititems(visitor)
+
+    if not candidates:
+        raise ValueError(
+            f"No numerical 3D dataset found in {file_path}"
+        )
+
+    valid_candidate_exists = any(
+        is_possible_hsi_shape(
+            shape,
+            hsi_channels,
+        )
+        for _, shape in candidates
+    )
+
+    if not valid_candidate_exists:
+        raise ValueError(
+            f"No {hsi_channels}-band cube found in "
+            f"{file_path}. "
+            f"HDF5 datasets: {candidates}"
+        )
+
+
+def inspect_standard_mat_file(
+    file_path: Path,
+    hsi_channels: int,
+    hsi_key: str,
+) -> None:
+    """
+    Inspect a standard MATLAB file using metadata only.
+
+    scipy.io.whosmat() returns names and shapes without loading full arrays.
+    """
+    try:
+        metadata = sio.whosmat(file_path)
+
+    except (
+        NotImplementedError,
+        ValueError,
+        OSError,
+    ):
+        inspect_hdf5_mat_file(
+            file_path=file_path,
+            hsi_channels=hsi_channels,
+            hsi_key=hsi_key,
+        )
+
+        return
+
+    candidates = [
+        (
+            name,
+            tuple(int(value) for value in shape),
+        )
+        for name, shape, _ in metadata
+        if len(shape) == 3
+    ]
+
+    if not candidates:
+        raise ValueError(
+            f"No 3D array found in {file_path}"
+        )
+
+    preferred_candidates = [
+        candidate
+        for candidate in candidates
+        if candidate[0] == hsi_key
+    ]
+
+    candidates_to_check = (
+        preferred_candidates
+        if preferred_candidates
+        else candidates
+    )
+
+    valid_candidate_exists = any(
+        is_possible_hsi_shape(
+            shape,
+            hsi_channels,
+        )
+        for _, shape in candidates_to_check
+    )
+
+    if not valid_candidate_exists:
+        raise ValueError(
+            f"No {hsi_channels}-band cube found in "
+            f"{file_path}. "
+            f"MAT arrays: {candidates}"
+        )
+
+
+def inspect_hsi_file_metadata(
+    file_path: Path,
+    hsi_channels: int,
+    hsi_key: str,
+) -> None:
+    """
+    Validate MAT files using metadata rather than loading the full cube.
+    """
+    extension = file_path.suffix.lower()
+
+    if extension == ".mat":
+        inspect_standard_mat_file(
+            file_path=file_path,
+            hsi_channels=hsi_channels,
+            hsi_key=hsi_key,
+        )
+
+        return
+
+    # Retain the previous full-load behavior for non-MAT formats.
+    cube = load_hsi_file(file_path)
+
+    if not is_possible_hsi_shape(
+        cube.shape,
+        hsi_channels,
+    ):
+        raise ValueError(
+            f"Invalid HSI shape {cube.shape} in {file_path}"
+        )
+
+
 def filter_valid_hsi_files(
     files: List[Path],
     hsi_channels: int,
     log_path: Path,
 ) -> List[Path]:
+    """
+    Validate files using metadata and cache the result for later runs.
+    """
     valid_files = []
     invalid_records = []
 
@@ -147,46 +366,89 @@ def filter_valid_hsi_files(
         exist_ok=True,
     )
 
-    print("\nChecking HSI files before training...")
+    VALIDATION_CACHE.parent.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+
+    fingerprint = make_files_fingerprint(files)
+
+    path_lookup = {
+        str(file_path.resolve()): file_path
+        for file_path in files
+    }
+
+    if VALIDATION_CACHE.exists():
+        try:
+            try:
+                cached_data = torch.load(
+                    VALIDATION_CACHE,
+                    map_location="cpu",
+                    weights_only=False,
+                )
+            except TypeError:
+                cached_data = torch.load(
+                    VALIDATION_CACHE,
+                    map_location="cpu",
+                )
+
+            if (
+                isinstance(cached_data, dict)
+                and cached_data.get("fingerprint") == fingerprint
+            ):
+                cached_valid_paths = cached_data.get(
+                    "valid_paths",
+                    [],
+                )
+
+                valid_files = [
+                    path_lookup[path]
+                    for path in cached_valid_paths
+                    if path in path_lookup
+                ]
+
+                invalid_records = cached_data.get(
+                    "invalid_records",
+                    [],
+                )
+
+                print("\nUsing cached HSI file validation.")
+                print(f"Valid files: {len(valid_files)}")
+                print(f"Invalid files: {len(invalid_records)}")
+
+                for record in invalid_records:
+                    print(
+                        "\nCached invalid file:\n"
+                        f"  File: {record['path']}\n"
+                        f"  Error: {record['error']}"
+                    )
+
+                if valid_files:
+                    return valid_files
+
+        except Exception as error:
+            print(
+                "Could not use validation cache. "
+                f"Running a new scan.\nReason: {error}"
+            )
+
+    print("\nChecking HSI file metadata before training...")
 
     for file_index, file_path in enumerate(files, start=1):
         try:
-            cube = load_hsi_file(file_path)
-
-            cube = convert_to_chw(
-                cube=cube,
-                hsi_channels=hsi_channels,
+            inspect_hsi_file_metadata(
                 file_path=file_path,
+                hsi_channels=hsi_channels,
+                hsi_key=HSI_KEY,
             )
-
-            if cube.ndim != 3:
-                raise ValueError(
-                    f"Expected 3 dimensions, found {cube.shape}"
-                )
-
-            if cube.shape[0] != hsi_channels:
-                raise ValueError(
-                    f"Expected {hsi_channels} bands, "
-                    f"found shape {cube.shape}"
-                )
-
-            if cube.shape[1] <= 0 or cube.shape[2] <= 0:
-                raise ValueError(
-                    f"Invalid spatial dimensions: {cube.shape}"
-                )
-
-            if not np.isfinite(cube).all():
-                raise ValueError(
-                    "Cube contains NaN or infinite values"
-                )
 
             valid_files.append(file_path)
 
         except Exception as error:
-            record = (
-                f"{file_path} | "
-                f"{type(error).__name__}: {error}"
-            )
+            record = {
+                "path": str(file_path.resolve()),
+                "error": f"{type(error).__name__}: {error}",
+            }
 
             invalid_records.append(record)
 
@@ -196,28 +458,55 @@ def filter_valid_hsi_files(
                 f"  Error: {error}"
             )
 
-        if file_index % 100 == 0 or file_index == len(files):
+        if (
+            file_index % 100 == 0
+            or file_index == len(files)
+        ):
             print(
                 f"Checked {file_index}/{len(files)} files | "
                 f"Valid: {len(valid_files)} | "
                 f"Invalid: {len(invalid_records)}"
             )
 
-    if invalid_records:
-        with open(log_path, "w", encoding="utf-8") as log_file:
-            log_file.write("\n".join(invalid_records))
-
-        print(
-            f"\nInvalid-file list saved to:\n{log_path}"
-        )
-
     if not valid_files:
         raise RuntimeError(
             "No valid HSI files remain after validation."
         )
 
-    return valid_files
+    if invalid_records:
+        with open(
+            log_path,
+            "w",
+            encoding="utf-8",
+        ) as log_file:
+            for record in invalid_records:
+                log_file.write(
+                    f"{record['path']} | "
+                    f"{record['error']}\n"
+                )
 
+        print(
+            f"\nInvalid-file list saved to:\n{log_path}"
+        )
+
+    torch.save(
+        {
+            "fingerprint": fingerprint,
+            "valid_paths": [
+                str(file_path.resolve())
+                for file_path in valid_files
+            ],
+            "invalid_records": invalid_records,
+        },
+        VALIDATION_CACHE,
+    )
+
+    print(
+        f"\nHSI validation cache saved to:\n"
+        f"{VALIDATION_CACHE}"
+    )
+
+    return valid_files
 
 def find_hsi_files(data_dir: str) -> List[Path]:
     data_path = Path(data_dir)
