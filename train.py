@@ -1479,14 +1479,21 @@ def main() -> None:
         weight_decay=WEIGHT_DECAY,
     )
 
-    scheduler = (
+    '''scheduler = (
         torch.optim.lr_scheduler.ReduceLROnPlateau(
             optimizer,
             mode="min",
             factor=0.5,
             patience=5,
         )
-    )
+    )'''
+    scheduler = (
+        torch.optim.lr_scheduler.CosineAnnealingLR(
+            optimizer,
+            T_max = NUM_EPOCHS,
+            eta_min = 1e-7,
+        )
+    
 
     scaler = GradScaler(
         enabled=use_amp
