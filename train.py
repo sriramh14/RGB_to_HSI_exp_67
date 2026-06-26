@@ -1,7 +1,7 @@
 import random
 from pathlib import Path
 from typing import List
-
+import h5py
 import numpy as np
 import scipy.io as sio
 import torch
@@ -82,6 +82,52 @@ def set_seed(seed: int) -> None:
 # File loading
 # ============================================================
 
+def load_mat_v73(file_path: Path) -> np.ndarray:
+    """
+    Loads the largest 3D numerical dataset from a MATLAB v7.3 file.
+    """
+
+    candidates = []
+
+    def visit_dataset(name, obj):
+        if isinstance(obj, h5py.Dataset):
+            try:
+                array = np.asarray(obj)
+
+                if (
+                    array.ndim == 3
+                    and np.issubdtype(array.dtype, np.number)
+                ):
+                    candidates.append((name, array))
+
+            except Exception:
+                pass
+
+    with h5py.File(str(file_path), "r") as file:
+        file.visititems(visit_dataset)
+
+    if not candidates:
+        raise ValueError(
+            f"No numerical 3D HSI array found in MATLAB v7.3 file: "
+            f"{file_path}"
+        )
+
+    _, cube = max(
+        candidates,
+        key=lambda item: item[1].size,
+    )
+
+    # MATLAB v7.3 dimensions are usually reversed when read with h5py.
+    # Example:
+    # MATLAB [H, W, C] -> h5py [C, W, H]
+    cube = np.transpose(
+        cube,
+        axes=tuple(range(cube.ndim - 1, -1, -1)),
+    )
+
+    return cube
+
+
 def find_hsi_files(data_dir: str) -> List[Path]:
     data_path = Path(data_dir)
 
@@ -155,11 +201,18 @@ def load_hsi_file(file_path: Path) -> np.ndarray:
         cube = max(candidates, key=lambda array: array.size)
 
     elif extension == ".mat":
-        loaded = sio.loadmat(file_path)
-        cube = extract_array_from_dictionary(
-            loaded,
-            file_path,
-        )
+        try:
+            # MATLAB files older than v7.3
+            loaded = sio.loadmat(file_path)
+    
+            cube = extract_array_from_dictionary(
+                loaded,
+                file_path,
+            )
+
+        except NotImplementedError:
+            # MATLAB v7.3 HDF5 files
+            cube = load_mat_v73(file_path)
 
     elif extension in {".pt", ".pth"}:
         loaded = torch.load(
