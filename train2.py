@@ -1037,7 +1037,7 @@ def train_one_epoch(
             }
         
             print(
-                f"Epoch {epoch:03d}/{NUM_EPOCHS:03d} | "
+                f"Batch {batch_index:03d}/{len(loader):03d} | "
                 f"LR: {current_learning_rate:.2e}\n"
                 f"  Train | "
                 f"Total: {training_metrics['loss']:.8f} | "
