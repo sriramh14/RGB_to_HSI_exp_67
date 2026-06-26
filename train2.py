@@ -1035,10 +1035,9 @@ def train_one_epoch(
                 key: value / total_samples
                 for key, value in totals.items()
             }
-        
+            
             print(
                 f"Batch {batch_index:03d}/{len(loader):03d} | "
-                f"LR: {current_learning_rate:.2e}\n"
                 f"  Train | "
                 f"Total: {training_metrics['loss']:.8f} | "
                 f"MSE: {training_metrics['rgb_mse']:.8f} | "
