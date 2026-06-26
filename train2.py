@@ -44,6 +44,13 @@ import torch.nn.functional as F
 from torch.cuda.amp import GradScaler, autocast
 from torch.utils.data import DataLoader, Dataset
 
+from loss.mrae import mrae
+from loss.rmse import rmse
+from loss.sam import sam
+from loss.psnr import psnr as custom_psnr
+from loss.ssim import ssim
+
+
 from models.DDS2M_rgb_to_hsi import RGBSpectralResponse
 
 # ============================================================
@@ -897,7 +904,46 @@ def calculate_rgb_metrics(
     psnr = 10.0 * torch.log10(1.0 / mse.clamp_min(1e-12))
     return mse, mae, psnr
 
+@torch.no_grad()
+def calculate_aux_losses(
+    reconstruction: torch.Tensor,
+    target: torch.Tensor,
+) -> tuple[
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+]:
+    """
+    Calculate evaluation metrics.
 
+    In the RGB-operator training stage:
+        reconstruction = predicted RGB, shape [B, 3, H, W]
+        target         = ground-truth RGB, shape [B, 3, H, W]
+
+    These are reporting metrics only and do not contribute to backpropagation.
+    """
+
+    # Convert to float32 because metric calculations can be unstable
+    # under float16 mixed precision.
+    reconstruction = reconstruction.float()
+    target = target.float()
+
+    mrae_value = mrae(target, reconstruction)
+    rmse_value = rmse(target, reconstruction)
+    sam_value = sam(target, reconstruction)
+    psnr_value = custom_psnr(target, reconstruction)
+    ssim_value = ssim(target, reconstruction)
+
+    return (
+        mrae_value,
+        rmse_value,
+        sam_value,
+        psnr_value,
+        ssim_value,
+    )
+    
 # ============================================================
 # Training
 # ============================================================
@@ -919,6 +965,11 @@ def train_one_epoch(
         "rgb_mae": 0.0,
         "rgb_psnr": 0.0,
         "smoothness": 0.0,
+        "mrae": 0.0,
+        "rmse": 0.0,
+        "sam": 0.0,
+        "custom_psnr": 0.0,
+        "ssim": 0.0,
     }
     total_samples = 0
 
@@ -951,8 +1002,19 @@ def train_one_epoch(
 
         with torch.no_grad():
             _, rgb_mae, rgb_psnr = calculate_rgb_metrics(
-                rgb_hat.detach(),
-                rgb.detach(),
+                rgb_hat.detach().float(),
+                rgb.detach().float(),
+            )
+        
+            (
+                mrae_value,
+                rmse_value,
+                sam_value,
+                custom_psnr_value,
+                ssim_value,
+            ) = calculate_aux_losses(
+                reconstruction=rgb_hat.detach(),
+                target=rgb.detach(),
             )
 
         batch_size = hsi.size(0)
@@ -961,16 +1023,30 @@ def train_one_epoch(
         totals["rgb_mae"] += rgb_mae.detach().item() * batch_size
         totals["rgb_psnr"] += rgb_psnr.detach().item() * batch_size
         totals["smoothness"] += smoothness.detach().item() * batch_size
+        totals["mrae"] += mrae_value.item() * batch_size
+        totals["rmse"] += rmse_value.item() * batch_size
+        totals["sam"] += sam_value.item() * batch_size
+        totals["custom_psnr"] += custom_psnr_value.item() * batch_size
+        totals["ssim"] += ssim_value.item() * batch_size
         total_samples += batch_size
 
         if batch_index % PRINT_EVERY == 0 or batch_index == len(loader):
-            running = {key: value / total_samples for key, value in totals.items()}
+            running = {
+                key: value / total_samples
+                for key, value in totals.items()
+            }
+        
             print(
                 f"  Batch {batch_index:04d}/{len(loader):04d} | "
                 f"Total: {running['loss']:.8f} | "
                 f"RGB MSE: {running['rgb_mse']:.8f} | "
                 f"RGB MAE: {running['rgb_mae']:.6f} | "
                 f"RGB PSNR: {running['rgb_psnr']:.3f} dB | "
+                f"MRAE: {running['mrae']:.6f} | "
+                f"RMSE: {running['rmse']:.6f} | "
+                f"SAM: {running['sam']:.6f} | "
+                f"Custom PSNR: {running['custom_psnr']:.3f} | "
+                f"SSIM: {running['ssim']:.6f} | "
                 f"Smooth: {running['smoothness']:.8f}"
             )
 
@@ -992,6 +1068,11 @@ def validate(
         "rgb_mae": 0.0,
         "rgb_psnr": 0.0,
         "smoothness": 0.0,
+        "mrae": 0.0,
+        "rmse": 0.0,
+        "sam": 0.0,
+        "custom_psnr": 0.0,
+        "ssim": 0.0,
     }
     total_samples = 0
 
@@ -1005,14 +1086,33 @@ def validate(
                 hsi=hsi,
                 rgb=rgb,
             )
-            _, rgb_mae, rgb_psnr = calculate_rgb_metrics(rgb_hat, rgb)
-
+        
+        _, rgb_mae, rgb_psnr = calculate_rgb_metrics(
+            rgb_hat.float(),
+            rgb.float(),
+        )
+        
+        (
+            mrae_value,
+            rmse_value,
+            sam_value,
+            custom_psnr_value,
+            ssim_value,
+        ) = calculate_aux_losses(
+            reconstruction=rgb_hat,
+            target=rgb,
+        )
         batch_size = hsi.size(0)
         totals["loss"] += loss.item() * batch_size
         totals["rgb_mse"] += rgb_mse_loss.item() * batch_size
         totals["rgb_mae"] += rgb_mae.item() * batch_size
         totals["rgb_psnr"] += rgb_psnr.item() * batch_size
         totals["smoothness"] += smoothness.item() * batch_size
+        totals["mrae"] += mrae_value.item() * batch_size
+        totals["rmse"] += rmse_value.item() * batch_size
+        totals["sam"] += sam_value.item() * batch_size
+        totals["custom_psnr"] += custom_psnr_value.item() * batch_size
+        totals["ssim"] += ssim_value.item() * batch_size
         total_samples += batch_size
 
     return {key: value / total_samples for key, value in totals.items()}
