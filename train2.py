@@ -51,8 +51,8 @@ from models.DDS2M_rgb_to_hsi import RGBSpectralResponse
 # ============================================================
 
 # Set these paths manually.
-HSI_DATA_DIR = "/kaggle/input/datasets/sriramhari14/ntire-2022/Train_spectral"
-RGB_DATA_DIR = "/kaggle/input/datasets/sriramhari14/ntire-2022/Train_RGB"
+HSI_DATA_DIR = "/kaggle/input/datasets/sriramhari14/ntire-2022/Train_spectral/Train_spectral"
+RGB_DATA_DIR = "/kaggle/input/datasets/sriramhari14/ntire-2022/Train_RGB/Train_RGB"
 OUTPUT_DIR = "./dds2m_rgb2hsi_checkpoints"
 
 HSI_KEY = "cube"
