@@ -1162,11 +1162,11 @@ def train_one_epoch(
                 f"Running recon: "
                 f"{average_reconstruction_loss:.6f} | "
                 f"Running KL: {average_kl_loss:.6f}"
-                f"Running MRAE: {average_mrae_loss:.6f}"
-                f"Running RMSE: {average_rmse_loss:.6f}"
-                f"Running SAM: {average_sam_loss:.6f}"
-                f"Running PSNR: {average_psnr_loss:.6f}"
-                f"Running SSIM: {average_ssim_loss:.6f}"
+                f" Running MRAE: {average_mrae_loss:.6f}"
+                f" Running RMSE: {average_rmse_loss:.6f}"
+                f" Running SAM: {average_sam_loss:.6f}"
+                f" Running PSNR: {average_psnr_loss:.6f}"
+                f" Running SSIM: {average_ssim_loss:.6f}"
             )
 
     return {
