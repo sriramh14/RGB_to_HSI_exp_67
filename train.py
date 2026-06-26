@@ -55,7 +55,7 @@ USE_AUGMENTATION = True
 
 SEED = 42
 GRADIENT_CLIP_NORM = 1.0
-
+PRINT_EVERY = 30
 
 SUPPORTED_EXTENSIONS = {
     ".npy",
@@ -655,7 +655,7 @@ def train_one_epoch(
     total_ssim = 0.0
     total_samples = 0
 
-    for hsi in loader:
+    for batch_index, hsi in enumerate(loader, start=1):
         hsi = hsi.to(
             device,
             non_blocking=True,
@@ -739,6 +739,55 @@ def train_one_epoch(
         )
 
         total_samples += batch_size
+        if (
+            batch_index % PRINT_EVERY == 0
+            or batch_index == len(loader)
+        ):
+            average_total_loss = (
+                total_loss / total_samples
+            )
+        
+            average_reconstruction_loss = (
+                total_reconstruction / total_samples
+            )
+        
+            average_kl_loss = (
+                total_kl / total_samples
+            )
+            
+            average_mrae_loss = (
+                total_mrae / total_samples
+            )
+            
+            average_rmse_loss = (
+                total_rmse / total_samples
+            )
+            
+            average_sam_loss = (
+                total_sam / total_samples
+            )
+            
+            average_psnr_loss = (
+                total_psnr / total_samples
+            )
+            
+            average_ssim_loss = (
+                total_ssim / total_samples
+            )
+            
+        
+            print(
+                f"  Batch {batch_index:04d}/{len(loader):04d} | "
+                f"Running total: {average_total_loss:.6f} | "
+                f"Running recon: "
+                f"{average_reconstruction_loss:.6f} | "
+                f"Running KL: {average_kl_loss:.6f}"
+                f"Running MRAE: {average_mrae_loss:.6f}"
+                f"Running RMSE: {average_rmse_loss:.6f}"
+                f"Running SAM: {average_sam_loss:.6f}"
+                f"Running PSNR: {average_psnr_loss:.6f}"
+                f"Running SSIM: {average_ssim_loss:.6f}"
+            )
 
     return {
         "loss": (
