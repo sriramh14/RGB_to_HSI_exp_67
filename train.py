@@ -713,23 +713,23 @@ def train_one_epoch(
             * batch_size
         )
         total_mrae += (
-            mrae_value.detach().item()
+            mrae_value
             * batch_size
         )
         total_rmse += (
-            rmse_value.detach().item()
+            rmse_value
             * batch_size
         )
         total_sam += (
-            sam_value.detach().item()
+            sam_value
             * batch_size
         )
         total_psnr += (
-            psnr_value.detach().item()
+            psnr_value
             * batch_size
         )
         total_ssim += (
-            ssim_value.detach().item()
+            ssim_value
             * batch_size
         )
 
