@@ -187,7 +187,7 @@ class HSIDecoder(nn.Module):
         out_channels: int = 31,
         base_channels: int = 64,
         latent_channels: int = 16,
-        num_res_blocks: int = 2,
+        num_res_blocks: int = 4,
     ):
         super().__init__()
 
