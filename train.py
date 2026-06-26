@@ -1528,9 +1528,13 @@ def main() -> None:
             use_amp=use_amp,
         )
 
-        scheduler.step(
-            validation_metrics["loss"]
-        )
+        #Uncomment if needed
+        #scheduler.step(
+            #validation_metrics["loss"]
+        #)
+
+        
+        scheduler.step()
 
         current_learning_rate = (
             optimizer.param_groups[0]["lr"]
