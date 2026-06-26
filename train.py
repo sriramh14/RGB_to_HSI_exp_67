@@ -1061,7 +1061,6 @@ def train_one_epoch(
                 mu=mu,
                 logvar=logvar,
             )
-            (mrae_value,rmse_value,sam_value,psnr_value,ssim_value) = calculate_aux_losses(reconstruction = reconstruction,target = hsi,mu = mu,logvar = logvar)
             
 
         if not torch.isfinite(loss):
@@ -1080,6 +1079,19 @@ def train_one_epoch(
 
         scaler.step(optimizer)
         scaler.update()
+        with torch.no_grad():
+            (
+                mrae_value,
+                rmse_value,
+                sam_value,
+                psnr_value,
+                ssim_value,
+            ) = calculate_aux_losses(
+                reconstruction=reconstruction.detach(),
+                target=hsi.detach(),
+                mu=mu.detach(),
+                logvar=logvar.detach(),
+            )
 
         batch_size = hsi.size(0)
 
@@ -1098,23 +1110,27 @@ def train_one_epoch(
             * batch_size
         )
         total_mrae += (
-            mrae_value
+            mrae_value.detach().item()
             * batch_size
         )
+        
         total_rmse += (
-            rmse_value
+            rmse_value.detach().item()
             * batch_size
         )
+        
         total_sam += (
-            sam_value
+            sam_value.detach().item()
             * batch_size
         )
+        
         total_psnr += (
-            psnr_value
+            psnr_value.detach().item()
             * batch_size
         )
+        
         total_ssim += (
-            ssim_value
+            ssim_value.detach().item()
             * batch_size
         )
 
