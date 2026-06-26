@@ -648,6 +648,11 @@ def train_one_epoch(
     total_loss = 0.0
     total_reconstruction = 0.0
     total_kl = 0.0
+    total_mrae = 0.0
+    total_rmse = 0.0
+    total_sam = 0.0
+    total_psnr = 0.0
+    total_ssim = 0.0
     total_samples = 0
 
     for hsi in loader:
