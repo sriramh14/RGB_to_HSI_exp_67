@@ -1493,6 +1493,7 @@ def main() -> None:
             T_max = NUM_EPOCHS,
             eta_min = 1e-7,
         )
+    )
     
 
     scaler = GradScaler(
