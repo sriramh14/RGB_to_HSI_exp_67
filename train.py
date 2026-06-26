@@ -24,7 +24,7 @@ from loss.ssim import ssim
 # Configuration
 # ============================================================
 
-DATA_DIR = "/path/to/hsi_directory"
+DATA_DIR = "/kaggle/input/datasets/sriramhari14/ntire-2022/Train_spectral"
 OUTPUT_DIR = "./vae_checkpoints"
 
 HSI_CHANNELS = 31
