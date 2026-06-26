@@ -84,32 +84,41 @@ def set_seed(seed: int) -> None:
 
 def load_mat_v73(file_path: Path) -> np.ndarray:
     """
-    Loads the largest 3D numerical dataset from a MATLAB v7.3 file.
+    Load the largest numerical 3D dataset from a MATLAB v7.3 file.
     """
 
     candidates = []
 
     def visit_dataset(name, obj):
-        if isinstance(obj, h5py.Dataset):
-            try:
-                array = np.asarray(obj)
+        if not isinstance(obj, h5py.Dataset):
+            return
 
-                if (
-                    array.ndim == 3
-                    and np.issubdtype(array.dtype, np.number)
-                ):
-                    candidates.append((name, array))
+        try:
+            if obj.ndim != 3:
+                return
 
-            except Exception:
-                pass
+            array = np.asarray(obj)
 
-    with h5py.File(str(file_path), "r") as file:
-        file.visititems(visit_dataset)
+            if np.issubdtype(array.dtype, np.number):
+                candidates.append((name, array))
+
+        except Exception:
+            return
+
+    try:
+        with h5py.File(str(file_path), "r") as h5_file:
+            h5_file.visititems(visit_dataset)
+
+    except OSError as error:
+        raise OSError(
+            f"Could not read MATLAB v7.3 file:\n"
+            f"{file_path}\n"
+            f"Reason: {error}"
+        ) from error
 
     if not candidates:
         raise ValueError(
-            f"No numerical 3D HSI array found in MATLAB v7.3 file: "
-            f"{file_path}"
+            f"No numerical 3D HSI array found in: {file_path}"
         )
 
     _, cube = max(
@@ -117,15 +126,97 @@ def load_mat_v73(file_path: Path) -> np.ndarray:
         key=lambda item: item[1].size,
     )
 
-    # MATLAB v7.3 dimensions are usually reversed when read with h5py.
-    # Example:
-    # MATLAB [H, W, C] -> h5py [C, W, H]
+    # h5py commonly returns MATLAB dimensions in reverse order.
     cube = np.transpose(
         cube,
         axes=tuple(range(cube.ndim - 1, -1, -1)),
     )
 
     return cube
+
+def filter_valid_hsi_files(
+    files: List[Path],
+    hsi_channels: int,
+    log_path: Path,
+) -> List[Path]:
+    valid_files = []
+    invalid_records = []
+
+    log_path.parent.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+
+    print("\nChecking HSI files before training...")
+
+    for file_index, file_path in enumerate(files, start=1):
+        try:
+            cube = load_hsi_file(file_path)
+
+            cube = convert_to_chw(
+                cube=cube,
+                hsi_channels=hsi_channels,
+                file_path=file_path,
+            )
+
+            if cube.ndim != 3:
+                raise ValueError(
+                    f"Expected 3 dimensions, found {cube.shape}"
+                )
+
+            if cube.shape[0] != hsi_channels:
+                raise ValueError(
+                    f"Expected {hsi_channels} bands, "
+                    f"found shape {cube.shape}"
+                )
+
+            if cube.shape[1] <= 0 or cube.shape[2] <= 0:
+                raise ValueError(
+                    f"Invalid spatial dimensions: {cube.shape}"
+                )
+
+            if not np.isfinite(cube).all():
+                raise ValueError(
+                    "Cube contains NaN or infinite values"
+                )
+
+            valid_files.append(file_path)
+
+        except Exception as error:
+            record = (
+                f"{file_path} | "
+                f"{type(error).__name__}: {error}"
+            )
+
+            invalid_records.append(record)
+
+            print(
+                "\nSkipping invalid file:\n"
+                f"  File: {file_path}\n"
+                f"  Error: {error}"
+            )
+
+        if file_index % 100 == 0 or file_index == len(files):
+            print(
+                f"Checked {file_index}/{len(files)} files | "
+                f"Valid: {len(valid_files)} | "
+                f"Invalid: {len(invalid_records)}"
+            )
+
+    if invalid_records:
+        with open(log_path, "w", encoding="utf-8") as log_file:
+            log_file.write("\n".join(invalid_records))
+
+        print(
+            f"\nInvalid-file list saved to:\n{log_path}"
+        )
+
+    if not valid_files:
+        raise RuntimeError(
+            "No valid HSI files remain after validation."
+        )
+
+    return valid_files
 
 
 def find_hsi_files(data_dir: str) -> List[Path]:
@@ -992,12 +1083,22 @@ def main() -> None:
         and device.type == "cuda"
     )
 
-    all_files = find_hsi_files(DATA_DIR)
+    output_dir = Path(OUTPUT_DIR)
 
-    (
-        training_files,
-        validation_files,
-    ) = split_files(
+    output_dir.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+    
+    all_files = find_hsi_files(DATA_DIR)
+    
+    all_files = filter_valid_hsi_files(
+        files=all_files,
+        hsi_channels=HSI_CHANNELS,
+        log_path=output_dir / "invalid_hsi_files.txt",
+    )
+    
+    training_files, validation_files = split_files(
         files=all_files,
         validation_fraction=VALIDATION_FRACTION,
         seed=SEED,
