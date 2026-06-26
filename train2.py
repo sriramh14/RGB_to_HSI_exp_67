@@ -1016,7 +1016,7 @@ def train_one_epoch(
                 reconstruction=rgb_hat.detach(),
                 target=rgb.detach(),
             )
-
+            
         batch_size = hsi.size(0)
         totals["loss"] += loss.detach().item() * batch_size
         totals["rgb_mse"] += rgb_mse_loss.detach().item() * batch_size
@@ -1039,18 +1039,18 @@ def train_one_epoch(
             print(
                 f"Batch {batch_index:03d}/{len(loader):03d} | "
                 f"  Train | "
-                f"Total: {totals['loss']:.8f} | "
-                f"MSE: {totals['rgb_mse']:.8f} | "
-                f"MAE: {totals['rgb_mae']:.6f} | "
-                f"MRAE: {totals['mrae']:.6f} | "
-                f"RMSE: {totals['rmse']:.6f} | "
-                f"SAM: {totals['sam']:.6f} | "
-                f"PSNR: {totals['custom_psnr']:.3f} | "
-                f"SSIM: {totals['ssim']:.6f}\n"
+                f"Total: {running['loss']:.8f} | "
+                f"MSE: {running['rgb_mse']:.8f} | "
+                f"MAE: {running['rgb_mae']:.6f} | "
+                f"MRAE: {running['mrae']:.6f} | "
+                f"RMSE: {running['rmse']:.6f} | "
+                f"SAM: {running['sam']:.6f} | "
+                f"PSNR: {running['custom_psnr']:.3f} | "
+                f"SSIM: {running['ssim']:.6f}\n"
                 
             )
 
-    return {key: value / total_samples for key, value in totals.items()}
+    return {key: value / total_samples for key, value in running.items()}
 
 
 @torch.no_grad()
