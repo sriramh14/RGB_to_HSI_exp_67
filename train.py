@@ -12,7 +12,12 @@ from torch.utils.data import DataLoader, Dataset
 from models import HSIVAE
 
 # Change these imports to match your loss files.
-from loss.reconstruction import reconstruction_loss, kl_divergence_loss
+from loss.vae_losses import reconstruction_loss,kl_divergence_loss
+from loss.mrae import mrae
+from loss.psnr import psnr
+from loss.rmse import rmse
+from loss.sam import sam
+from loss.ssim import ssim
 
 
 # ============================================================
@@ -551,8 +556,27 @@ def calculate_vae_loss(
         total_loss,
         reconstruction_value,
         kl_value,
-    )
+    ) 
 
+
+def calculate_aux_losses (
+    reconstruction: torch.Tensor,
+    target: torch.Tensor,
+    mu: torch.Tensor,
+    logvar: torch.Tensor,
+) -> tuple[
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+]:
+    mrae_value = mrae(target,reconstruction)
+    rmse_value = rmse(target,reconstruction)
+    sam_value = sam(target,reconstruction)
+    psnr_value = psnr(target,reconstruction)
+    ssim_value = ssim(target,reconstruction)
+    
+    return (mrae_value,rmse_value,sam_value,psnr_value,ssim_value)
 
 # ============================================================
 # Training
@@ -599,6 +623,8 @@ def train_one_epoch(
                 mu=mu,
                 logvar=logvar,
             )
+            mrae_value,rmse_value,sam_value,psnr_value,ssim_value = calculate_aux_losses (reconstruction = reconstruction,target = hsi,mu = mu,logvar = logvar)
+            
 
         if not torch.isfinite(loss):
             raise FloatingPointError(
@@ -633,6 +659,26 @@ def train_one_epoch(
             kl_value.detach().item()
             * batch_size
         )
+        total_mrae += (
+            mrae_value.detach().item()
+            * batch_size
+        )
+        total_rmse += (
+            rmse_value.detach().item()
+            * batch_size
+        )
+        total_sam += (
+            sam_value.detach().item()
+            * batch_size
+        )
+        total_psnr += (
+            psnr_value.detach().item()
+            * batch_size
+        )
+        total_ssim += (
+            ssim_value.detach().item()
+            * batch_size
+        )
 
         total_samples += batch_size
 
@@ -647,6 +693,26 @@ def train_one_epoch(
         ),
         "kl": (
             total_kl
+            / total_samples
+        ),
+        "mrae": (
+            total_mrae
+            / total_samples
+        ),
+        "rmse": (
+            total_rmse
+            / total_samples
+        ),
+        "sam": (
+            total_sam
+            / total_samples
+        ),
+        "psnr": (
+            total_psnr
+            / total_samples
+        ),
+        "ssim": (
+            total_ssim
             / total_samples
         ),
     }
@@ -689,6 +755,7 @@ def validate(
                 mu=mu,
                 logvar=logvar,
             )
+            mrae_value,rmse_value,sam_value,psnr_value,ssim_value = calculate_aux_losses (reconstruction = reconstruction,target = hsi,mu = mu,logvar = logvar)
 
         batch_size = hsi.size(0)
 
@@ -706,6 +773,26 @@ def validate(
             kl_value.item()
             * batch_size
         )
+        total_mrae += (
+            mrae_value.detach().item()
+            * batch_size
+        )
+        total_rmse += (
+            rmse_value.detach().item()
+            * batch_size
+        )
+        total_sam += (
+            sam_value.detach().item()
+            * batch_size
+        )
+        total_psnr += (
+            psnr_value.detach().item()
+            * batch_size
+        )
+        total_ssim += (
+            ssim_value.detach().item()
+            * batch_size
+        )
 
         total_samples += batch_size
 
@@ -720,6 +807,26 @@ def validate(
         ),
         "kl": (
             total_kl
+            / total_samples
+        ),
+        "mrae": (
+            total_mrae
+            / total_samples
+        ),
+        "rmse": (
+            total_rmse
+            / total_samples
+        ),
+        "sam": (
+            total_sam
+            / total_samples
+        ),
+        "psnr": (
+            total_psnr
+            / total_samples
+        ),
+        "ssim": (
+            total_ssim
             / total_samples
         ),
     }
