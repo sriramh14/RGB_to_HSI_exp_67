@@ -1037,17 +1037,26 @@ def train_one_epoch(
             }
         
             print(
-                f"  Batch {batch_index:04d}/{len(loader):04d} | "
-                f"Total: {running['loss']:.8f} | "
-                f"RGB MSE: {running['rgb_mse']:.8f} | "
-                f"RGB MAE: {running['rgb_mae']:.6f} | "
-                f"RGB PSNR: {running['rgb_psnr']:.3f} dB | "
-                f"MRAE: {running['mrae']:.6f} | "
-                f"RMSE: {running['rmse']:.6f} | "
-                f"SAM: {running['sam']:.6f} | "
-                f"Custom PSNR: {running['custom_psnr']:.3f} | "
-                f"SSIM: {running['ssim']:.6f} | "
-                f"Smooth: {running['smoothness']:.8f}"
+                f"Epoch {epoch:03d}/{NUM_EPOCHS:03d} | "
+                f"LR: {current_learning_rate:.2e}\n"
+                f"  Train | "
+                f"Total: {training_metrics['loss']:.8f} | "
+                f"MSE: {training_metrics['rgb_mse']:.8f} | "
+                f"MAE: {training_metrics['rgb_mae']:.6f} | "
+                f"MRAE: {training_metrics['mrae']:.6f} | "
+                f"RMSE: {training_metrics['rmse']:.6f} | "
+                f"SAM: {training_metrics['sam']:.6f} | "
+                f"PSNR: {training_metrics['custom_psnr']:.3f} | "
+                f"SSIM: {training_metrics['ssim']:.6f}\n"
+                f"  Val   | "
+                f"Total: {validation_metrics['loss']:.8f} | "
+                f"MSE: {validation_metrics['rgb_mse']:.8f} | "
+                f"MAE: {validation_metrics['rgb_mae']:.6f} | "
+                f"MRAE: {validation_metrics['mrae']:.6f} | "
+                f"RMSE: {validation_metrics['rmse']:.6f} | "
+                f"SAM: {validation_metrics['sam']:.6f} | "
+                f"PSNR: {validation_metrics['custom_psnr']:.3f} | "
+                f"SSIM: {validation_metrics['ssim']:.6f}"
             )
 
     return {key: value / total_samples for key, value in totals.items()}
