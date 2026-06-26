@@ -676,7 +676,7 @@ def train_one_epoch(
                 mu=mu,
                 logvar=logvar,
             )
-            mrae_value,rmse_value,sam_value,psnr_value,ssim_value = calculate_aux_losses (reconstruction = reconstruction,target = hsi,mu = mu,logvar = logvar)
+            (mrae_value,rmse_value,sam_value,psnr_value,ssim_value) = calculate_aux_losses(reconstruction = reconstruction,target = hsi,mu = mu,logvar = logvar)
             
 
         if not torch.isfinite(loss):
