@@ -433,13 +433,17 @@ class RGB_to_HSI_w_diffusion(nn.Module):
         # ── 5. Reconstruct clean latent from predicted noise, then decode → HSI ──
         # Invert the noise schedule: estimate z0 from zₜ and predicted noise
         # This mirrors what a DDPM sampler does at inference in a single step.
-        alpha_bar_t = noise_scheduler.alphas_cumprod[t_idx]          # (B,)
-        alpha_bar_t = alpha_bar_t.view(-1, 1, 1, 1)              # broadcast to (B,1,1,1)
-        
-        z0_pred = (zt - (1 - alpha_bar_t).sqrt() * pred_noise) / alpha_bar_t.sqrt()
-        
+        alpha_bar_t = noise_scheduler.alphas_cumprod[t_idx].to(zt.device)
+        alpha_bar_t = alpha_bar_t.view(-1, 1, 1, 1).clamp(min=1e-5)  # prevent /0
+
+        #To avoid nan error
+        z0_pred   = (zt - (1 - alpha_bar_t).sqrt() * pred_noise) / alpha_bar_t.sqrt()
+        z0_pred   = torch.clamp(z0_pred, -10.0, 10.0)
+
+        #normalising hsi to 0 to 1
         with torch.no_grad():
             hsi_recon = self.vae.decode(z0_pred)
+            hsi_recon = torch.clamp(hsi_recon, 0.0, 1.0)
         
         return loss, hsi_recon, pred_noise
             
