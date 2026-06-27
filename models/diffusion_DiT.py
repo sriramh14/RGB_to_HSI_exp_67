@@ -409,7 +409,7 @@ class RGB_to_HSI_w_diffusion(nn.Module):
         """
         # ── 1. Encode HSI → clean latent z0 (frozen VAE, no grad needed) ────────
         with torch.no_grad():
-            z0, _, _ = self.vae.encode(hsi, sample=True)
+            z0, _, _ = self.vae.encode(hsi, sample=False)
         
         # ── 2. Sample noise and corrupt z0 → zₜ ─────────────────────────────────
         noise = torch.randn_like(z0)
