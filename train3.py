@@ -64,7 +64,7 @@ PATCH_SIZE_PX      = 64    # spatial crop size fed to the model (pixels)
 PATCHES_PER_IMAGE  = 4
 
 BATCH_SIZE     = 4
-NUM_EPOCHS     = 75
+NUM_EPOCHS     = 100
 LEARNING_RATE  = 1e-4
 WEIGHT_DECAY   = 1e-4
 
@@ -801,7 +801,7 @@ def train_one_epoch(
             raise FloatingPointError(f"Non-finite training loss: {loss.item()}")
 
         scaler.scale(loss).backward()
-        scaler.unscale_(optimizer)
+        #scaler.unscale_(optimizer)
         torch.nn.utils.clip_grad_norm_(
             trainable_params, max_norm=GRADIENT_CLIP_NORM
         )
