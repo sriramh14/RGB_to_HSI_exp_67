@@ -312,6 +312,107 @@ def make_files_fingerprint(files: List[Path]) -> str:
         )
     return hashlib.sha256("\n".join(records).encode("utf-8")).hexdigest()
 
+# ============================================================
+# HSI metadata inspection  (fast — no full cube load)
+# ============================================================
+
+def is_possible_hsi_shape(shape, hsi_channels: int) -> bool:
+    return (
+        len(shape) == 3
+        and hsi_channels in shape
+        and all(int(s) > 0 for s in shape)
+    )
+
+
+def inspect_hdf5_mat_file(
+    file_path: Path,
+    hsi_channels: int,
+    hsi_key: str,
+) -> None:
+    candidates = []
+
+    with h5py.File(str(file_path), "r") as h5_file:
+        if hsi_key in h5_file and isinstance(h5_file[hsi_key], h5py.Dataset):
+            dataset = h5_file[hsi_key]
+            candidates.append((hsi_key, tuple(int(v) for v in dataset.shape)))
+        else:
+            def visitor(name, obj):
+                if not isinstance(obj, h5py.Dataset) or obj.ndim != 3:
+                    return
+                try:
+                    if np.issubdtype(obj.dtype, np.number):
+                        candidates.append((name, tuple(int(v) for v in obj.shape)))
+                except TypeError:
+                    pass
+            h5_file.visititems(visitor)
+
+    if not candidates:
+        raise ValueError(f"No numerical 3D dataset found in {file_path}")
+
+    if not any(is_possible_hsi_shape(shape, hsi_channels) for _, shape in candidates):
+        raise ValueError(
+            f"No {hsi_channels}-band cube found in {file_path}. "
+            f"HDF5 datasets: {candidates}"
+        )
+
+
+def inspect_standard_mat_file(
+    file_path: Path,
+    hsi_channels: int,
+    hsi_key: str,
+) -> None:
+    try:
+        metadata = sio.whosmat(file_path)
+    except (NotImplementedError, ValueError, OSError):
+        # Falls back to HDF5 header inspection for v7.3 files.
+        inspect_hdf5_mat_file(file_path, hsi_channels, hsi_key)
+        return
+
+    candidates = [
+        (name, tuple(int(v) for v in shape))
+        for name, shape, _ in metadata
+        if len(shape) == 3
+    ]
+
+    if not candidates:
+        raise ValueError(f"No 3D array found in {file_path}")
+
+    preferred = [c for c in candidates if c[0] == hsi_key]
+    to_check  = preferred if preferred else candidates
+
+    if not any(is_possible_hsi_shape(shape, hsi_channels) for _, shape in to_check):
+        raise ValueError(
+            f"No {hsi_channels}-band cube found in {file_path}. "
+            f"MAT arrays: {candidates}"
+        )
+
+
+def inspect_hsi_file_metadata(
+    file_path: Path,
+    hsi_channels: int,
+    hsi_key: str,
+) -> None:
+    """
+    Validate without loading the full cube.
+    .mat  → whosmat() or HDF5 header only.
+    other → full load only as a last resort (npy/npz/pt are fast anyway).
+    """
+    if file_path.suffix.lower() == ".mat":
+        inspect_standard_mat_file(file_path, hsi_channels, hsi_key)
+        return
+
+    # For .npy / .npz / .pt / .pth the load is already cheap,
+    # so we reuse the existing loader and just check the shape.
+    cube = load_hsi_file(file_path)
+    if not is_possible_hsi_shape(cube.shape, hsi_channels):
+        raise ValueError(
+            f"Invalid HSI shape {cube.shape} in {file_path}"
+        )
+
+
+# ============================================================
+# Pair validation with cache  (replaces the old filter_valid_pairs)
+# ============================================================
 
 def filter_valid_pairs(
     pairs: List[Tuple[Path, Path]],
@@ -319,17 +420,18 @@ def filter_valid_pairs(
     log_path: Path,
 ) -> List[Tuple[Path, Path]]:
     """
-    Quick-validate HSI files by metadata; keep pairs where HSI is valid.
-    RGB files are only checked by extension (loading is fast enough at runtime).
+    Fast-validate HSI files by metadata only; RGB files are checked
+    by extension. Results are cached and reused when the file set
+    is unchanged (same paths, sizes, and mtimes).
     """
     VALIDATION_CACHE.parent.mkdir(parents=True, exist_ok=True)
     log_path.parent.mkdir(parents=True, exist_ok=True)
 
-    hsi_files = [p for p, _ in pairs]
+    hsi_files   = [h for h, _ in pairs]
     fingerprint = make_files_fingerprint(hsi_files)
-
     pair_lookup = {str(h.resolve()): (h, r) for h, r in pairs}
 
+    # ── Try cache ─────────────────────────────────────────────────────────────
     if VALIDATION_CACHE.exists():
         try:
             try:
@@ -343,34 +445,50 @@ def filter_valid_pairs(
                 isinstance(cached, dict)
                 and cached.get("fingerprint") == fingerprint
             ):
-                valid_paths = cached.get("valid_hsi_paths", [])
-                valid_pairs = [
-                    pair_lookup[p]
-                    for p in valid_paths
-                    if p in pair_lookup
+                valid_paths   = cached.get("valid_hsi_paths", [])
+                invalid_records = cached.get("invalid_records", [])
+                valid_pairs   = [
+                    pair_lookup[p] for p in valid_paths if p in pair_lookup
                 ]
+
                 print("\nUsing cached pair validation.")
-                print(f"Valid pairs: {len(valid_pairs)}")
+                print(f"Valid pairs:   {len(valid_pairs)}")
+                print(f"Invalid files: {len(invalid_records)}")
+
+                for record in invalid_records:
+                    print(
+                        f"\nCached invalid file:\n"
+                        f"  File:  {record['path']}\n"
+                        f"  Error: {record['error']}"
+                    )
+
                 if valid_pairs:
                     return valid_pairs
+
         except Exception as error:
             print(f"Could not use validation cache. Re-scanning.\nReason: {error}")
 
-    print("\nValidating HSI file metadata...")
-    valid_pairs = []
+    # ── Full scan (metadata only for .mat, cheap load for others) ─────────────
+    print("\nChecking HSI file metadata before training...")
+
+    valid_pairs     = []
     invalid_records = []
 
     for idx, (hsi_file, rgb_file) in enumerate(pairs, start=1):
         try:
-            cube = load_hsi_file(hsi_file)
-            convert_to_chw(cube, hsi_channels, hsi_file)
+            inspect_hsi_file_metadata(
+                file_path=hsi_file,
+                hsi_channels=hsi_channels,
+                hsi_key=HSI_KEY,
+            )
             valid_pairs.append((hsi_file, rgb_file))
+
         except Exception as error:
             invalid_records.append({
-                "path": str(hsi_file.resolve()),
+                "path":  str(hsi_file.resolve()),
                 "error": f"{type(error).__name__}: {error}",
             })
-            print(f"\nSkipping {hsi_file}: {error}")
+            print(f"\nSkipping invalid file:\n  File: {hsi_file}\n  Error: {error}")
 
         if idx % 100 == 0 or idx == len(pairs):
             print(
@@ -390,7 +508,7 @@ def filter_valid_pairs(
 
     torch.save(
         {
-            "fingerprint": fingerprint,
+            "fingerprint":    fingerprint,
             "valid_hsi_paths": [str(h.resolve()) for h, _ in valid_pairs],
             "invalid_records": invalid_records,
         },
