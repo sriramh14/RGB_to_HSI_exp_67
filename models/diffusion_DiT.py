@@ -363,7 +363,7 @@ class RGB_to_HSI_w_diffusion(nn.Module):
         learn_sigma = True,
         patch_size = 4,
         input_size = 64,
-        
+        T = 1000, 
     ):
         super().__init__()  # ← this line is missing in your file
 
