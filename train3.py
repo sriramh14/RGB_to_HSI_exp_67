@@ -30,7 +30,7 @@ from loss.ssim import ssim
 # HSI files and RGB files must share the same filename stem,
 # e.g. "scene_001.mat" (HSI) and "scene_001.png" (RGB).
 HSI_DATA_DIR  = "/kaggle/input/datasets/sriramhari14/ntire-2022/Train_spectral/Train_spectral"
-RGB_DATA_DIR  = "/kaggle/input/datasets/ntire-2022/Train_RGB/Train_RGB"
+RGB_DATA_DIR  = "/kaggle/input/datasets/sriramhari14/ntire-2022/Train_RGB/Train_RGB"
 
 # Path to a pre-trained VAE checkpoint produced by the VAE training script.
 VAE_CHECKPOINT = "./vae_checkpoints/best_vae.pth"
