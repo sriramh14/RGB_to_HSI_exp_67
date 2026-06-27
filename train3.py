@@ -1014,6 +1014,7 @@ def main() -> None:
         learn_sigma=LEARN_SIGMA,
         patch_size=PATCH_SIZE,
         input_size=INPUT_SIZE,
+        T = NUM_TRAIN_TIMESTEPS
     ).to(device)
 
     # Replace the randomly-initialised VAE inside the model with the
