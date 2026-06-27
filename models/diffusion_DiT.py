@@ -195,7 +195,7 @@ class DiT(nn.Module):
 
         self.x_embedder = PatchEmbed(input_size, patch_size, in_channels, hidden_size, bias=True)
         self.t_embedder = TimestepEmbedder(hidden_size)
-        self.y_embedder = LabelEmbedder(num_classes, hidden_size, class_dropout_prob)
+        #self.y_embedder = LabelEmbedder(num_classes, hidden_size, class_dropout_prob)
         num_patches = self.x_embedder.num_patches
         # Will use fixed sin-cos embedding:
         self.pos_embed = nn.Parameter(torch.zeros(1, num_patches, hidden_size), requires_grad=False)
@@ -349,4 +349,97 @@ def get_1d_sincos_pos_embed_from_grid(embed_dim, pos):
     emb = np.concatenate([emb_sin, emb_cos], axis=1)  # (M, D)
     return emb
 
+
+class RGB_to_HSI_w_diffusion(nn.Module):
+    def __init__(
+        self,
+        hsi_channels = 31,
+        base_channels = 64,
+        latent_channels = 16,
+        num_res_blocks = 2,
+        hidden_size = 128,
+        depth = 10,
+        num_heads = 16,
+        mlp_ratio = 4.0,
+        class_dropout_prob = 0.1,
+        learn_sigma = True,
+        patch_size = 4,
+        input_size = 64,
+        
+    ):
+        
+        self.vae = HSIVAE(
+            hsi_channels,
+            base_channels,
+            latent_channels,
+            num_res_blocks
+        )
+        self.dit = DiT(
+            input_size=input_size,
+            patch_size=patch_size,
+            in_channels=latent_channels,
+            hidden_size=hidden_size,
+            depth=depth,
+            num_heads=num_heads,
+            mlp_ratio=mlp_ratio,
+            class_dropout_prob=class_dropout_prob,
+            learn_sigma=learn_sigma,
+        )
+
+        
+        self.vae.encoder.requires_grad_(False)
+        self.vae.decoder.requires_grad_(False)
+
+        self.vae.encoder.eval()
+        self.vae.decoder.eval()
+
+def forward(self, hsi, rgb, t, noise_scheduler):
+    """
+    Latent diffusion training forward pass.
+
+    Args:
+        hsi:             (B, C, H, W)  Ground-truth hyperspectral image.
+        rgb:             (B, 3, H, W)  Paired RGB image used as condition.
+        t:               (B,)          Diffusion timesteps sampled from U[0, T].
+        noise_scheduler:               Scheduler with .add_noise(z0, noise, t) method.
+
+    Returns:
+        loss:        Scalar — MSE noise prediction loss in latent space.
+        hsi_recon:   (B, C, H, W) — decoded HSI reconstruction in pixel space.
+        pred_noise:  (B, latent_C, H', W') — raw noise prediction from DiT.
+    """
+    # ── 1. Encode HSI → clean latent z0 (frozen VAE, no grad needed) ────────
+    with torch.no_grad():
+        z0, _, _ = self.vae.encode(hsi, sample=True)
+
+    # ── 2. Sample noise and corrupt z0 → zₜ ─────────────────────────────────
+    noise = torch.randn_like(z0)
+    zt = noise_scheduler.add_noise(z0, noise, t)
+
+    # ── 3. DiT predicts noise from zₜ, conditioned on RGB ───────────────────
+    pred = self.dit(zt, t, rgb)
+
+    if self.dit.learn_sigma:
+        # DiT outputs [pred_noise | pred_sigma] — only noise half is trained
+        pred_noise = pred[:, :self.dit.in_channels]
+    else:
+        pred_noise = pred
+
+    # ── 4. Noise prediction loss in latent space ─────────────────────────────
+    loss = nn.functional.mse_loss(pred_noise, noise)
+
+    # ── 5. Reconstruct clean latent from predicted noise, then decode → HSI ──
+    # Invert the noise schedule: estimate z0 from zₜ and predicted noise
+    # This mirrors what a DDPM sampler does at inference in a single step.
+    alpha_bar_t = noise_scheduler.alphas_cumprod[t]          # (B,)
+    alpha_bar_t = alpha_bar_t.view(-1, 1, 1, 1)              # broadcast to (B,1,1,1)
+
+    z0_pred = (zt - (1 - alpha_bar_t).sqrt() * pred_noise) / alpha_bar_t.sqrt()
+
+    with torch.no_grad():
+        hsi_recon = self.vae.decode(z0_pred)
+
+    return loss, hsi_recon, pred_noise
+    
+        
 
