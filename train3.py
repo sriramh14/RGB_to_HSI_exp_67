@@ -13,7 +13,7 @@ from torch.utils.data import DataLoader, Dataset
 from diffusers import DDPMScheduler
 
 from models.HSI_VAE import HSIVAE
-from models.dit import RGB_to_HSI_w_diffusion  # adjust to your actual module path
+from models.diffusion_DiT import RGB_to_HSI_w_diffusion  # adjust to your actual module path
 
 from loss.mrae import mrae
 from loss.psnr import psnr
@@ -608,6 +608,35 @@ def calculate_aux_losses(
 # ============================================================
 # Training
 # ============================================================
+def sample_logit_normal_timesteps(
+    batch_size: int,
+    device: torch.device,
+    m: float = 0.0,
+    s: float = 1.0,
+) -> torch.Tensor:
+    """
+    Sample timesteps from a logit-normal distribution.
+
+    π_ln(t; m, s) = 1 / (s√(2π) · t(1-t)) · exp(-(logit(t) - m)² / 2s²)
+
+    This is equivalent to:
+        u ~ N(m, s²)
+        t = sigmoid(u) = 1 / (1 + e^{-u})
+    which keeps t strictly in (0, 1).
+
+    Args:
+        batch_size: number of timesteps to sample (one per batch item).
+        device:     target device.
+        m:          mean of the underlying normal (0.0 = symmetric around t=0.5).
+        s:          std of the underlying normal (higher = wider spread).
+
+    Returns:
+        t: (batch_size,) float tensor with values in (0, 1).
+    """
+    u = torch.randn(batch_size, device=device) * s + m
+    t = torch.sigmoid(u)   # logit-normal sample: t = sigmoid(N(m, s²))
+    return t
+
 
 def train_one_epoch(
     model: RGB_to_HSI_w_diffusion,
@@ -629,11 +658,19 @@ def train_one_epoch(
         rgb = rgb.to(device, non_blocking=True)
 
         # Sample random timesteps for each item in the batch.
-        t = torch.randint(
-            0,
-            noise_scheduler.config.num_train_timesteps,
-            (hsi.size(0),),
+        #t = torch.randint(
+           # 0,
+            #noise_scheduler.config.num_train_timesteps,
+            #(hsi.size(0),),
+            #device=device,
+        #)
+
+        # After
+        t = sample_logit_normal_timesteps(
+            batch_size=hsi.size(0),
             device=device,
+            m=0.0,   # adjust to bias toward noisier (m < 0) or cleaner (m > 0) timesteps
+            s=1.0,
         )
 
         optimizer.zero_grad(set_to_none=True)
