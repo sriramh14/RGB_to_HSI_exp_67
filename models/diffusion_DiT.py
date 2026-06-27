@@ -414,10 +414,12 @@ def forward(self, hsi, rgb, t, noise_scheduler):
 
     # ── 2. Sample noise and corrupt z0 → zₜ ─────────────────────────────────
     noise = torch.randn_like(z0)
-    zt = noise_scheduler.add_noise(z0, noise, t)
+    t_idx = (t * (T - 1)).long().clamp(0, T - 1)   # (B,) int64
+
+    zt = noise_scheduler.add_noise(z0, noise, t_idx)
 
     # ── 3. DiT predicts noise from zₜ, conditioned on RGB ───────────────────
-    pred = self.dit(zt, t, rgb)
+    pred = self.dit(zt, t_idx, rgb)
 
     if self.dit.learn_sigma:
         # DiT outputs [pred_noise | pred_sigma] — only noise half is trained
@@ -431,7 +433,7 @@ def forward(self, hsi, rgb, t, noise_scheduler):
     # ── 5. Reconstruct clean latent from predicted noise, then decode → HSI ──
     # Invert the noise schedule: estimate z0 from zₜ and predicted noise
     # This mirrors what a DDPM sampler does at inference in a single step.
-    alpha_bar_t = noise_scheduler.alphas_cumprod[t]          # (B,)
+    alpha_bar_t = noise_scheduler.alphas_cumprod[t_idx]          # (B,)
     alpha_bar_t = alpha_bar_t.view(-1, 1, 1, 1)              # broadcast to (B,1,1,1)
 
     z0_pred = (zt - (1 - alpha_bar_t).sqrt() * pred_noise) / alpha_bar_t.sqrt()
