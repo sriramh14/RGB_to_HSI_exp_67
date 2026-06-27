@@ -367,6 +367,8 @@ class RGB_to_HSI_w_diffusion(nn.Module):
         input_size = 64,
         
     ):
+        super().__init__()  # ← this line is missing in your file
+
         
         self.vae = HSIVAE(
             hsi_channels,
