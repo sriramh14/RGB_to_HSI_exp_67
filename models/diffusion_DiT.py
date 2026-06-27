@@ -178,7 +178,7 @@ class DiT(nn.Module):
         input_size=32,
         patch_size=2,
         in_channels=4,
-        hidden_size=1152,
+        hidden_size=128,
         depth=28,
         num_heads=16,
         mlp_ratio=4.0,
@@ -203,7 +203,7 @@ class DiT(nn.Module):
         self.blocks = nn.ModuleList([
             DiTBlock(hidden_size, num_heads, mlp_ratio=mlp_ratio) for _ in range(depth)
         ])
-        self.rgb_encoder = RGBConditionEncoder()
+        self.rgb_encoder = RGBConditionEncoder(hidden_size = hidden_size)
         self.final_layer = FinalLayer(hidden_size, patch_size, self.out_channels)
         self.initialize_weights()
 
