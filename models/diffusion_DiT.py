@@ -393,10 +393,9 @@ class RGB_to_HSI_w_diffusion(nn.Module):
         self.vae.encoder.eval()
         self.vae.decoder.eval()
         
-        def forward(self, hsi, rgb, t, noise_scheduler):
-            """
-            Latent diffusion training forward pass.
-        
+    def forward(self, hsi, rgb, t, noise_scheduler):
+        """
+        Latent diffusion training forward pass.
             Args:
                 hsi:             (B, C, H, W)  Ground-truth hyperspectral image.
                 rgb:             (B, 3, H, W)  Paired RGB image used as condition.
@@ -407,41 +406,41 @@ class RGB_to_HSI_w_diffusion(nn.Module):
                 loss:        Scalar — MSE noise prediction loss in latent space.
                 hsi_recon:   (B, C, H, W) — decoded HSI reconstruction in pixel space.
                 pred_noise:  (B, latent_C, H', W') — raw noise prediction from DiT.
-            """
-            # ── 1. Encode HSI → clean latent z0 (frozen VAE, no grad needed) ────────
-            with torch.no_grad():
-                z0, _, _ = self.vae.encode(hsi, sample=True)
+        """
+        # ── 1. Encode HSI → clean latent z0 (frozen VAE, no grad needed) ────────
+        with torch.no_grad():
+            z0, _, _ = self.vae.encode(hsi, sample=True)
         
-            # ── 2. Sample noise and corrupt z0 → zₜ ─────────────────────────────────
-            noise = torch.randn_like(z0)
-            t_idx = (t * (T - 1)).long().clamp(0, T - 1)   # (B,) int64
+        # ── 2. Sample noise and corrupt z0 → zₜ ─────────────────────────────────
+        noise = torch.randn_like(z0)
+        t_idx = (t * (T - 1)).long().clamp(0, T - 1)   # (B,) int64
         
-            zt = noise_scheduler.add_noise(z0, noise, t_idx)
+        zt = noise_scheduler.add_noise(z0, noise, t_idx)
         
-            # ── 3. DiT predicts noise from zₜ, conditioned on RGB ───────────────────
-            pred = self.dit(zt, t_idx, rgb)
+        # ── 3. DiT predicts noise from zₜ, conditioned on RGB ───────────────────
+        pred = self.dit(zt, t_idx, rgb)
         
-            if self.dit.learn_sigma:
-                # DiT outputs [pred_noise | pred_sigma] — only noise half is trained
-                pred_noise = pred[:, :self.dit.in_channels]
-            else:
-                pred_noise = pred
+        if self.dit.learn_sigma:
+            # DiT outputs [pred_noise | pred_sigma] — only noise half is trained
+            pred_noise = pred[:, :self.dit.in_channels]
+        else:
+            pred_noise = pred
         
-            # ── 4. Noise prediction loss in latent space ─────────────────────────────
-            loss = nn.functional.mse_loss(pred_noise, noise)
+        # ── 4. Noise prediction loss in latent space ─────────────────────────────
+        loss = nn.functional.mse_loss(pred_noise, noise)
         
-            # ── 5. Reconstruct clean latent from predicted noise, then decode → HSI ──
-            # Invert the noise schedule: estimate z0 from zₜ and predicted noise
-            # This mirrors what a DDPM sampler does at inference in a single step.
-            alpha_bar_t = noise_scheduler.alphas_cumprod[t_idx]          # (B,)
-            alpha_bar_t = alpha_bar_t.view(-1, 1, 1, 1)              # broadcast to (B,1,1,1)
+        # ── 5. Reconstruct clean latent from predicted noise, then decode → HSI ──
+        # Invert the noise schedule: estimate z0 from zₜ and predicted noise
+        # This mirrors what a DDPM sampler does at inference in a single step.
+        alpha_bar_t = noise_scheduler.alphas_cumprod[t_idx]          # (B,)
+        alpha_bar_t = alpha_bar_t.view(-1, 1, 1, 1)              # broadcast to (B,1,1,1)
         
-            z0_pred = (zt - (1 - alpha_bar_t).sqrt() * pred_noise) / alpha_bar_t.sqrt()
+        z0_pred = (zt - (1 - alpha_bar_t).sqrt() * pred_noise) / alpha_bar_t.sqrt()
         
-            with torch.no_grad():
-                hsi_recon = self.vae.decode(z0_pred)
+        with torch.no_grad():
+            hsi_recon = self.vae.decode(z0_pred)
         
-            return loss, hsi_recon, pred_noise
+        return loss, hsi_recon, pred_noise
             
                 
         
