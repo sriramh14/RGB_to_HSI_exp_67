@@ -367,7 +367,7 @@ class RGB_to_HSI_w_diffusion(nn.Module):
     ):
         super().__init__()  # ← this line is missing in your file
 
-        
+        self.T = T
         self.vae = HSIVAE(
             hsi_channels,
             base_channels,
@@ -413,7 +413,7 @@ class RGB_to_HSI_w_diffusion(nn.Module):
         
         # ── 2. Sample noise and corrupt z0 → zₜ ─────────────────────────────────
         noise = torch.randn_like(z0)
-        t_idx = (t * (T - 1)).long().clamp(0, T - 1)   # (B,) int64
+        t_idx = (t * (self.T - 1)).long().clamp(0, self.T - 1)   # (B,) int64
         
         zt = noise_scheduler.add_noise(z0, noise, t_idx)
         
