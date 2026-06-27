@@ -1,137 +1,90 @@
-"""Train the HSI -> RGB operator used by the RGB adaptation of DDS2M.
-
-Why this script trains only the operator
-----------------------------------------
-The original DDS2M spatial and spectral networks are *untrained* networks:
-they are initialized from scratch and optimized separately for each RGB test
-image during reverse diffusion. They are therefore not trained across the
-paired dataset.
-
-The only dataset-level quantity missing in the RGB-to-HSI setting is the
-camera/forward operator R in
-
-    RGB = R @ HSI.
-
-Because only paired RGB/HSI images are available, this script learns that
-3 x K linear operator from the pairs and saves it. The saved operator is then
-loaded and frozen when running per-image DDS2M restoration.
-
-The data-loading structure follows the supplied HSI VAE training script. The
-main changes are intentionally limited to:
-
-1. locating the paired RGB file for every HSI file;
-2. loading RGB alongside HSI;
-3. applying the same crop and augmentation to both;
-4. returning ``rgb, hsi`` from the dataset.
-
-Edit ``HSI_DATA_DIR``, ``RGB_DATA_DIR`` and ``resolve_rgb_path`` to match the
-local paired-image layout.
-"""
-
-from __future__ import annotations
-
-import hashlib
 import random
+import hashlib
 from pathlib import Path
-from typing import List, Sequence, Tuple
-
+from typing import List, Tuple
 import h5py
 import numpy as np
-from PIL import Image
 import scipy.io as sio
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
 from torch.cuda.amp import GradScaler, autocast
 from torch.utils.data import DataLoader, Dataset
+from diffusers import DDPMScheduler
+
+from models.HSI_VAE import HSIVAE
+from models.dit import RGB_to_HSI_w_diffusion  # adjust to your actual module path
 
 from loss.mrae import mrae
+from loss.psnr import psnr
 from loss.rmse import rmse
 from loss.sam import sam
-from loss.psnr import psnr as custom_psnr
 from loss.ssim import ssim
 
-
-from models.DDS2M_rgb_to_hsi import RGBSpectralResponse
 
 # ============================================================
 # Configuration
 # ============================================================
 
-# Set these paths manually.
-HSI_DATA_DIR = "/kaggle/input/datasets/sriramhari14/ntire-2022/Train_spectral/Train_spectral"
-RGB_DATA_DIR = "/kaggle/input/datasets/sriramhari14/ntire-2022/Train_RGB/Train_RGB"
-OUTPUT_DIR = "./dds2m_rgb2hsi_checkpoints"
+# Directories containing paired HSI and RGB files.
+# HSI files and RGB files must share the same filename stem,
+# e.g. "scene_001.mat" (HSI) and "scene_001.png" (RGB).
+HSI_DATA_DIR  = "/kaggle/input/datasets/ntire-2022/Train_spectral"
+RGB_DATA_DIR  = "/kaggle/input/datasets/ntire-2022/Train_RGB"
+
+# Path to a pre-trained VAE checkpoint produced by the VAE training script.
+VAE_CHECKPOINT = "./vae_checkpoints/best_vae.pth"
+
+OUTPUT_DIR = "./diffusion_checkpoints"
 
 HSI_KEY = "cube"
-VALIDATION_CACHE = Path(OUTPUT_DIR) / "hsi_validation_cache.pth"
+VALIDATION_CACHE = Path(OUTPUT_DIR) / "diffusion_validation_cache.pth"
 
-HSI_CHANNELS = 31
-PATCH_SIZE = 64
-PATCHES_PER_IMAGE = 4
+# ── Model architecture ────────────────────────────────────────────────────────
+HSI_CHANNELS    = 31
+BASE_CHANNELS   = 64
+LATENT_CHANNELS = 16
+NUM_RES_BLOCKS  = 2
 
-BATCH_SIZE = 4
-NUM_EPOCHS = 50
-LEARNING_RATE = 1e-3
-WEIGHT_DECAY = 0.0
+# DiT hyper-parameters
+HIDDEN_SIZE  = 128
+DEPTH        = 10
+NUM_HEADS    = 16
+MLP_RATIO    = 4.0
+PATCH_SIZE   = 4       # DiT patch size (tokens)
+INPUT_SIZE   = 16      # spatial size of the latent (64 px image → 2 downsamples → 16)
+LEARN_SIGMA  = True
 
-# The original reverse equations require a linear operator. Keeping this False
-# learns an unconstrained 3 x K matrix, which is usually a better first test
-# when the RGB files may contain an unknown processing pipeline.
-CONSTRAIN_OPERATOR_NONNEGATIVE = False
-OPERATOR_SMOOTHNESS_WEIGHT = 1e-4
+# ── Diffusion scheduler ───────────────────────────────────────────────────────
+NUM_TRAIN_TIMESTEPS = 1000
+BETA_SCHEDULE       = "squaredcos_cap_v2"   # cosine schedule; change to "linear" if preferred
+
+# ── Training ──────────────────────────────────────────────────────────────────
+PATCH_SIZE_PX      = 64    # spatial crop size fed to the model (pixels)
+PATCHES_PER_IMAGE  = 4
+
+BATCH_SIZE     = 4
+NUM_EPOCHS     = 75
+LEARNING_RATE  = 1e-4
+WEIGHT_DECAY   = 1e-4
 
 VALIDATION_FRACTION = 0.1
+NUM_WORKERS         = 4
+USE_AMP             = True
+USE_AUGMENTATION    = True
 
-# HSI normalization options retained from the supplied loader:
-#   "none"        : dataset is already in the desired range
-#   "minmax"      : normalize each complete cube independently
-#   "band_minmax" : normalize every spectral band independently
-# For a physically meaningful shared RGB operator, "none" is preferable when
-# all HSI cubes are already consistently normalized to [0, 1].
-HSI_NORMALIZATION = "none"
+SEED                = 42
+GRADIENT_CLIP_NORM  = 1.0
+PRINT_EVERY         = 30
 
-# RGB normalization:
-#   "auto"   : integer images are divided by the dtype maximum; floating
-#              arrays with values above 1 are divided by 255 when possible
-#   "none"   : retain the loaded values
-#   "minmax" : per-image min-max normalization
-RGB_NORMALIZATION = "auto"
-
-NUM_WORKERS = 4
-USE_AMP = True
-USE_AUGMENTATION = True
-
-SEED = 42
-GRADIENT_CLIP_NORM = 1.0
-PRINT_EVERY = 30
-
-SUPPORTED_HSI_EXTENSIONS = {
-    ".npy",
-    ".npz",
-    ".mat",
-    ".pt",
-    ".pth",
-}
-
-SUPPORTED_RGB_EXTENSIONS = {
-    ".png",
-    ".jpg",
-    ".jpeg",
-    ".bmp",
-    ".tif",
-    ".tiff",
-    ".npy",
-    ".npz",
-    ".mat",
-    ".pt",
-    ".pth",
-}
+# ── File formats ──────────────────────────────────────────────────────────────
+SUPPORTED_HSI_EXTENSIONS = {".npy", ".npz", ".mat", ".pt", ".pth"}
+SUPPORTED_RGB_EXTENSIONS = {".png", ".jpg", ".jpeg", ".npy", ".pt", ".pth"}
 
 
 # ============================================================
 # Reproducibility
 # ============================================================
-
 
 def set_seed(seed: int) -> None:
     random.seed(seed)
@@ -141,12 +94,10 @@ def set_seed(seed: int) -> None:
 
 
 # ============================================================
-# File loading: HSI
+# File loading  (HSI — identical helpers to the VAE script)
 # ============================================================
 
-
 def load_mat_v73(file_path: Path) -> np.ndarray:
-    """Load the largest numerical 3D dataset from a MATLAB v7.3 file."""
     candidates = []
 
     def visit_dataset(name, obj):
@@ -170,49 +121,24 @@ def load_mat_v73(file_path: Path) -> np.ndarray:
         ) from error
 
     if not candidates:
-        raise ValueError(f"No numerical 3D array found in: {file_path}")
+        raise ValueError(f"No numerical 3D HSI array found in: {file_path}")
 
-    _, array = max(candidates, key=lambda item: item[1].size)
-
-    # MATLAB v7.3 arrays are commonly exposed with reversed dimensions.
-    array = np.transpose(
-        array,
-        axes=tuple(range(array.ndim - 1, -1, -1)),
-    )
-    return array
+    _, cube = max(candidates, key=lambda item: item[1].size)
+    cube = np.transpose(cube, axes=tuple(range(cube.ndim - 1, -1, -1)))
+    return cube
 
 
-def extract_array_from_dictionary(
-    data: dict,
-    file_path: Path,
-    preferred_channels: int | None = None,
-) -> np.ndarray:
+def extract_array_from_dictionary(data: dict, file_path: Path) -> np.ndarray:
     candidates = []
-
     for key, value in data.items():
         if key.startswith("__"):
             continue
         if isinstance(value, torch.Tensor):
             value = value.detach().cpu().numpy()
-        if not isinstance(value, np.ndarray):
-            continue
-        value = np.squeeze(value)
-        if value.ndim != 3:
-            continue
-        candidates.append(value)
-
+        if isinstance(value, np.ndarray) and value.ndim == 3:
+            candidates.append(value)
     if not candidates:
-        raise ValueError(f"No three-dimensional array found in {file_path}")
-
-    if preferred_channels is not None:
-        preferred = [
-            array
-            for array in candidates
-            if preferred_channels in array.shape
-        ]
-        if preferred:
-            return max(preferred, key=lambda array: array.size)
-
+        raise ValueError(f"No three-dimensional HSI array found in {file_path}")
     return max(candidates, key=lambda array: array.size)
 
 
@@ -224,24 +150,16 @@ def load_hsi_file(file_path: Path) -> np.ndarray:
 
     elif extension == ".npz":
         loaded = np.load(file_path)
-        candidates = [
-            loaded[key]
-            for key in loaded.files
-            if np.squeeze(loaded[key]).ndim == 3
-        ]
+        candidates = [loaded[k] for k in loaded.files if loaded[k].ndim == 3]
         if not candidates:
             raise ValueError(f"No three-dimensional array found in {file_path}")
-        cube = max(candidates, key=lambda array: array.size)
+        cube = max(candidates, key=lambda a: a.size)
 
     elif extension == ".mat":
         try:
             loaded = sio.loadmat(file_path)
-            cube = extract_array_from_dictionary(
-                loaded,
-                file_path,
-                preferred_channels=HSI_CHANNELS,
-            )
-        except (NotImplementedError, ValueError):
+            cube = extract_array_from_dictionary(loaded, file_path)
+        except NotImplementedError:
             cube = load_mat_v73(file_path)
 
     elif extension in {".pt", ".pth"}:
@@ -251,11 +169,7 @@ def load_hsi_file(file_path: Path) -> np.ndarray:
         elif isinstance(loaded, np.ndarray):
             cube = loaded
         elif isinstance(loaded, dict):
-            cube = extract_array_from_dictionary(
-                loaded,
-                file_path,
-                preferred_channels=HSI_CHANNELS,
-            )
+            cube = extract_array_from_dictionary(loaded, file_path)
         else:
             raise TypeError(f"Unsupported object in {file_path}: {type(loaded)}")
 
@@ -267,18 +181,16 @@ def load_hsi_file(file_path: Path) -> np.ndarray:
 
     if cube.ndim != 3:
         raise ValueError(
-            f"Expected a 3D HSI cube in {file_path}, found shape {cube.shape}"
+            f"Expected a 3D cube in {file_path}, but found shape {cube.shape}"
         )
-
     return cube
 
 
-def convert_hsi_to_chw(
+def convert_to_chw(
     cube: np.ndarray,
     hsi_channels: int,
     file_path: Path,
 ) -> np.ndarray:
-    """Convert [C,H,W] or [H,W,C] to [C,H,W]."""
     if cube.shape[0] == hsi_channels:
         return cube
     if cube.shape[-1] == hsi_channels:
@@ -289,173 +201,107 @@ def convert_hsi_to_chw(
     )
 
 
-# ============================================================
-# File loading: RGB
-# ============================================================
-
-
 def load_rgb_file(file_path: Path) -> np.ndarray:
-    """Load RGB and return a float array before final normalization."""
+    """
+    Load an RGB image as a float32 array in [C, H, W] format, range [0, 1].
+    Supports: .png/.jpg/.jpeg (via PIL), .npy, .pt/.pth.
+    """
     extension = file_path.suffix.lower()
 
-    if extension in {".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff"}:
-        with Image.open(file_path) as image:
-            image = image.convert("RGB")
-            array = np.asarray(image)
+    if extension in {".png", ".jpg", ".jpeg"}:
+        from PIL import Image
+        img = Image.open(file_path).convert("RGB")
+        array = np.asarray(img, dtype=np.float32) / 255.0   # (H, W, 3)
+        return np.transpose(array, (2, 0, 1))                # (3, H, W)
 
-    elif extension == ".npy":
-        array = np.load(file_path)
+    if extension == ".npy":
+        array = np.load(file_path).astype(np.float32)
+        if array.ndim == 2:
+            array = np.stack([array] * 3, axis=0)
+        elif array.shape[-1] == 3:
+            array = np.transpose(array, (2, 0, 1))
+        return array
 
-    elif extension == ".npz":
-        loaded = np.load(file_path)
-        candidates = [
-            loaded[key]
-            for key in loaded.files
-            if np.squeeze(loaded[key]).ndim == 3
-            and 3 in np.squeeze(loaded[key]).shape
-        ]
-        if not candidates:
-            raise ValueError(f"No RGB array found in {file_path}")
-        array = max(candidates, key=lambda candidate: candidate.size)
-
-    elif extension == ".mat":
-        try:
-            loaded = sio.loadmat(file_path)
-            array = extract_array_from_dictionary(
-                loaded,
-                file_path,
-                preferred_channels=3,
-            )
-        except (NotImplementedError, ValueError):
-            array = load_mat_v73(file_path)
-
-    elif extension in {".pt", ".pth"}:
+    if extension in {".pt", ".pth"}:
         loaded = torch.load(file_path, map_location="cpu")
         if isinstance(loaded, torch.Tensor):
-            array = loaded.detach().cpu().numpy()
-        elif isinstance(loaded, np.ndarray):
-            array = loaded
-        elif isinstance(loaded, dict):
-            array = extract_array_from_dictionary(
-                loaded,
-                file_path,
-                preferred_channels=3,
-            )
+            array = loaded.float().numpy()
         else:
-            raise TypeError(f"Unsupported object in {file_path}: {type(loaded)}")
-
-    else:
-        raise ValueError(f"Unsupported RGB extension: {extension}")
-
-    array = np.asarray(array)
-    array = np.squeeze(array)
-
-    if array.ndim != 3:
-        raise ValueError(
-            f"Expected a 3D RGB image in {file_path}, found shape {array.shape}"
-        )
-
-    return array
-
-
-def convert_rgb_to_chw(array: np.ndarray, file_path: Path) -> np.ndarray:
-    """Convert [3,H,W] or [H,W,3] to [3,H,W]."""
-    if array.shape[0] == 3:
+            raise TypeError(f"Unsupported object in RGB file {file_path}")
+        if array.ndim == 2:
+            array = np.stack([array] * 3, axis=0)
+        elif array.shape[-1] == 3:
+            array = np.transpose(array, (2, 0, 1))
         return array
-    if array.shape[-1] == 3:
-        return np.transpose(array, (2, 0, 1))
-    raise ValueError(
-        f"Cannot identify the RGB channel dimension in {file_path}. "
-        f"Shape: {array.shape}"
-    )
+
+    raise ValueError(f"Unsupported RGB extension: {extension}")
 
 
 # ============================================================
-# Pairing
+# File discovery and pairing
 # ============================================================
-
 
 def find_hsi_files(data_dir: str) -> List[Path]:
     data_path = Path(data_dir)
     if not data_path.exists():
-        raise FileNotFoundError(f"HSI data directory does not exist: {data_path}")
-
+        raise FileNotFoundError(f"HSI directory does not exist: {data_path}")
     files = sorted(
-        path
-        for path in data_path.rglob("*")
-        if path.is_file() and path.suffix.lower() in SUPPORTED_HSI_EXTENSIONS
+        p for p in data_path.rglob("*")
+        if p.is_file() and p.suffix.lower() in SUPPORTED_HSI_EXTENSIONS
     )
-
     if not files:
-        raise RuntimeError(
-            f"No supported HSI files found in {data_path}. "
-            f"Supported extensions: {sorted(SUPPORTED_HSI_EXTENSIONS)}"
-        )
+        raise RuntimeError(f"No HSI files found in {data_path}")
     return files
 
 
-def resolve_rgb_path(hsi_path: Path) -> Path:
-    """Map one HSI path to its paired RGB path.
-
-    This is the only pairing function that normally needs editing.
-
-    The default implementation assumes mirrored directory structures and
-    identical stems, and searches the supported RGB extensions. Example:
-
-        HSI_DATA_DIR/scene_01.mat
-        RGB_DATA_DIR/scene_01.jpg
-
-    For filenames such as ``scene_01_clean.mat`` and ``scene_01_rgb.jpg``, edit
-    ``rgb_stem`` below.
+def pair_hsi_rgb_files(
+    hsi_dir: str,
+    rgb_dir: str,
+) -> List[Tuple[Path, Path]]:
     """
-    hsi_root = Path(HSI_DATA_DIR)
-    rgb_root = Path(RGB_DATA_DIR)
+    Match HSI files to RGB files by filename stem.
+    Raises if no pairs are found.
+    """
+    hsi_files = find_hsi_files(hsi_dir)
 
-    relative_parent = hsi_path.relative_to(hsi_root).parent
-    rgb_stem = hsi_path.stem
+    rgb_path = Path(rgb_dir)
+    if not rgb_path.exists():
+        raise FileNotFoundError(f"RGB directory does not exist: {rgb_path}")
 
-    for extension in sorted(SUPPORTED_RGB_EXTENSIONS):
-        candidate = rgb_root / relative_parent / f"{rgb_stem}{extension}"
-        if candidate.exists():
-            return candidate
+    rgb_by_stem = {}
+    for p in rgb_path.rglob("*"):
+        if p.is_file() and p.suffix.lower() in SUPPORTED_RGB_EXTENSIONS:
+            rgb_by_stem[p.stem] = p
 
-    raise FileNotFoundError(
-        f"No paired RGB file found for HSI:\n  {hsi_path}\n"
-        f"Expected stem: {rgb_stem}\n"
-        f"Searched under: {rgb_root / relative_parent}"
-    )
-
-
-def build_paired_files(hsi_files: Sequence[Path]) -> List[Tuple[Path, Path]]:
-    pairs: List[Tuple[Path, Path]] = []
+    pairs = []
     missing = []
-
-    for hsi_path in hsi_files:
-        try:
-            rgb_path = resolve_rgb_path(hsi_path)
-            pairs.append((hsi_path, rgb_path))
-        except FileNotFoundError as error:
-            missing.append(str(error))
+    for hsi_file in hsi_files:
+        rgb_file = rgb_by_stem.get(hsi_file.stem)
+        if rgb_file is not None:
+            pairs.append((hsi_file, rgb_file))
+        else:
+            missing.append(hsi_file)
 
     if missing:
-        missing_log = Path(OUTPUT_DIR) / "missing_rgb_pairs.txt"
-        missing_log.parent.mkdir(parents=True, exist_ok=True)
-        missing_log.write_text("\n\n".join(missing), encoding="utf-8")
-        print(
-            f"Skipped {len(missing)} HSI files without a paired RGB image. "
-            f"Details: {missing_log}"
-        )
+        print(f"\nWarning: {len(missing)} HSI files have no matching RGB file:")
+        for f in missing[:10]:
+            print(f"  {f}")
+        if len(missing) > 10:
+            print(f"  ... and {len(missing) - 10} more.")
 
     if not pairs:
-        raise RuntimeError("No valid RGB-HSI pairs were found.")
+        raise RuntimeError(
+            "No HSI/RGB pairs found. "
+            "Check that HSI and RGB files share the same filename stem."
+        )
 
+    print(f"Found {len(pairs)} paired HSI/RGB files.")
     return pairs
 
 
 # ============================================================
-# Optional HSI metadata validation retained from supplied script
+# Validation cache
 # ============================================================
-
 
 def make_files_fingerprint(files: List[Path]) -> str:
     records = []
@@ -467,393 +313,232 @@ def make_files_fingerprint(files: List[Path]) -> str:
     return hashlib.sha256("\n".join(records).encode("utf-8")).hexdigest()
 
 
-def is_possible_hsi_shape(shape, hsi_channels: int) -> bool:
-    return (
-        len(shape) == 3
-        and hsi_channels in shape
-        and all(int(size) > 0 for size in shape)
-    )
-
-
-def inspect_hdf5_mat_file(
-    file_path: Path,
-    hsi_channels: int,
-    hsi_key: str,
-) -> None:
-    candidates = []
-
-    with h5py.File(str(file_path), "r") as h5_file:
-        if hsi_key in h5_file and isinstance(h5_file[hsi_key], h5py.Dataset):
-            dataset = h5_file[hsi_key]
-            candidates.append((hsi_key, tuple(int(v) for v in dataset.shape)))
-        else:
-            def visitor(name, obj):
-                if not isinstance(obj, h5py.Dataset) or obj.ndim != 3:
-                    return
-                try:
-                    is_numeric = np.issubdtype(obj.dtype, np.number)
-                except TypeError:
-                    is_numeric = False
-                if is_numeric:
-                    candidates.append((name, tuple(int(v) for v in obj.shape)))
-
-            h5_file.visititems(visitor)
-
-    if not candidates:
-        raise ValueError(f"No numerical 3D dataset found in {file_path}")
-
-    if not any(
-        is_possible_hsi_shape(shape, hsi_channels)
-        for _, shape in candidates
-    ):
-        raise ValueError(
-            f"No {hsi_channels}-band cube found in {file_path}. "
-            f"HDF5 datasets: {candidates}"
-        )
-
-
-def inspect_standard_mat_file(
-    file_path: Path,
-    hsi_channels: int,
-    hsi_key: str,
-) -> None:
-    try:
-        metadata = sio.whosmat(file_path)
-    except (NotImplementedError, ValueError, OSError):
-        inspect_hdf5_mat_file(file_path, hsi_channels, hsi_key)
-        return
-
-    candidates = [
-        (name, tuple(int(value) for value in shape))
-        for name, shape, _ in metadata
-        if len(shape) == 3
-    ]
-
-    if not candidates:
-        raise ValueError(f"No 3D array found in {file_path}")
-
-    preferred = [candidate for candidate in candidates if candidate[0] == hsi_key]
-    candidates_to_check = preferred if preferred else candidates
-
-    if not any(
-        is_possible_hsi_shape(shape, hsi_channels)
-        for _, shape in candidates_to_check
-    ):
-        raise ValueError(
-            f"No {hsi_channels}-band cube found in {file_path}. "
-            f"MAT arrays: {candidates}"
-        )
-
-
-def inspect_hsi_file_metadata(
-    file_path: Path,
-    hsi_channels: int,
-    hsi_key: str,
-) -> None:
-    if file_path.suffix.lower() == ".mat":
-        inspect_standard_mat_file(file_path, hsi_channels, hsi_key)
-        return
-
-    cube = load_hsi_file(file_path)
-    if not is_possible_hsi_shape(cube.shape, hsi_channels):
-        raise ValueError(f"Invalid HSI shape {cube.shape} in {file_path}")
-
-
-def filter_valid_hsi_files(
-    files: List[Path],
+def filter_valid_pairs(
+    pairs: List[Tuple[Path, Path]],
     hsi_channels: int,
     log_path: Path,
-) -> List[Path]:
-    valid_files = []
-    invalid_records = []
-
-    log_path.parent.mkdir(parents=True, exist_ok=True)
+) -> List[Tuple[Path, Path]]:
+    """
+    Quick-validate HSI files by metadata; keep pairs where HSI is valid.
+    RGB files are only checked by extension (loading is fast enough at runtime).
+    """
     VALIDATION_CACHE.parent.mkdir(parents=True, exist_ok=True)
+    log_path.parent.mkdir(parents=True, exist_ok=True)
 
-    fingerprint = make_files_fingerprint(files)
-    path_lookup = {str(path.resolve()): path for path in files}
+    hsi_files = [p for p, _ in pairs]
+    fingerprint = make_files_fingerprint(hsi_files)
+
+    pair_lookup = {str(h.resolve()): (h, r) for h, r in pairs}
 
     if VALIDATION_CACHE.exists():
         try:
             try:
-                cached_data = torch.load(
-                    VALIDATION_CACHE,
-                    map_location="cpu",
-                    weights_only=False,
+                cached = torch.load(
+                    VALIDATION_CACHE, map_location="cpu", weights_only=False
                 )
             except TypeError:
-                cached_data = torch.load(VALIDATION_CACHE, map_location="cpu")
+                cached = torch.load(VALIDATION_CACHE, map_location="cpu")
 
             if (
-                isinstance(cached_data, dict)
-                and cached_data.get("fingerprint") == fingerprint
+                isinstance(cached, dict)
+                and cached.get("fingerprint") == fingerprint
             ):
-                valid_files = [
-                    path_lookup[path]
-                    for path in cached_data.get("valid_paths", [])
-                    if path in path_lookup
+                valid_paths = cached.get("valid_hsi_paths", [])
+                valid_pairs = [
+                    pair_lookup[p]
+                    for p in valid_paths
+                    if p in pair_lookup
                 ]
-                invalid_records = cached_data.get("invalid_records", [])
-                print("\nUsing cached HSI file validation.")
-                print(f"Valid files: {len(valid_files)}")
-                print(f"Invalid files: {len(invalid_records)}")
-                if valid_files:
-                    return valid_files
+                print("\nUsing cached pair validation.")
+                print(f"Valid pairs: {len(valid_pairs)}")
+                if valid_pairs:
+                    return valid_pairs
         except Exception as error:
-            print(
-                "Could not use validation cache. Running a new scan. "
-                f"Reason: {error}"
-            )
+            print(f"Could not use validation cache. Re-scanning.\nReason: {error}")
 
-    print("\nChecking HSI file metadata before training...")
+    print("\nValidating HSI file metadata...")
+    valid_pairs = []
+    invalid_records = []
 
-    for file_index, file_path in enumerate(files, start=1):
+    for idx, (hsi_file, rgb_file) in enumerate(pairs, start=1):
         try:
-            inspect_hsi_file_metadata(file_path, hsi_channels, HSI_KEY)
-            valid_files.append(file_path)
+            cube = load_hsi_file(hsi_file)
+            convert_to_chw(cube, hsi_channels, hsi_file)
+            valid_pairs.append((hsi_file, rgb_file))
         except Exception as error:
-            invalid_records.append(
-                {
-                    "path": str(file_path.resolve()),
-                    "error": f"{type(error).__name__}: {error}",
-                }
-            )
-            print(
-                "\nSkipping invalid file:\n"
-                f"  File: {file_path}\n"
-                f"  Error: {error}"
-            )
+            invalid_records.append({
+                "path": str(hsi_file.resolve()),
+                "error": f"{type(error).__name__}: {error}",
+            })
+            print(f"\nSkipping {hsi_file}: {error}")
 
-        if file_index % 100 == 0 or file_index == len(files):
+        if idx % 100 == 0 or idx == len(pairs):
             print(
-                f"Checked {file_index}/{len(files)} files | "
-                f"Valid: {len(valid_files)} | "
+                f"Checked {idx}/{len(pairs)} | "
+                f"Valid: {len(valid_pairs)} | "
                 f"Invalid: {len(invalid_records)}"
             )
 
-    if not valid_files:
-        raise RuntimeError("No valid HSI files remain after validation.")
+    if not valid_pairs:
+        raise RuntimeError("No valid HSI/RGB pairs remain after validation.")
 
     if invalid_records:
-        with open(log_path, "w", encoding="utf-8") as log_file:
-            for record in invalid_records:
-                log_file.write(f"{record['path']} | {record['error']}\n")
+        with open(log_path, "w", encoding="utf-8") as f:
+            for r in invalid_records:
+                f.write(f"{r['path']} | {r['error']}\n")
+        print(f"\nInvalid-file log saved to: {log_path}")
 
     torch.save(
         {
             "fingerprint": fingerprint,
-            "valid_paths": [str(path.resolve()) for path in valid_files],
+            "valid_hsi_paths": [str(h.resolve()) for h, _ in valid_pairs],
             "invalid_records": invalid_records,
         },
         VALIDATION_CACHE,
     )
-
-    return valid_files
+    print(f"Validation cache saved to: {VALIDATION_CACHE}")
+    return valid_pairs
 
 
 # ============================================================
-# Normalization and synchronized patch extraction
+# Normalization and patch extraction  (unchanged from VAE script)
 # ============================================================
-
 
 def normalize_cube(cube: np.ndarray, mode: str) -> np.ndarray:
-    cube = cube.astype(np.float32, copy=False)
-
     if mode == "none":
         return cube
-
     if mode == "minmax":
-        minimum = cube.min()
-        maximum = cube.max()
-        return (cube - minimum) / (maximum - minimum + 1e-8)
-
+        lo, hi = cube.min(), cube.max()
+        return (cube - lo) / (hi - lo + 1e-8)
     if mode == "band_minmax":
-        minimum = cube.min(axis=(1, 2), keepdims=True)
-        maximum = cube.max(axis=(1, 2), keepdims=True)
-        return (cube - minimum) / (maximum - minimum + 1e-8)
-
-    raise ValueError(f"Unknown HSI normalization mode: {mode}")
-
-
-def normalize_rgb(array: np.ndarray, mode: str) -> np.ndarray:
-    original_dtype = array.dtype
-    array = array.astype(np.float32, copy=False)
-
-    if mode == "none":
-        return array
-
-    if mode == "minmax":
-        minimum = float(array.min())
-        maximum = float(array.max())
-        return (array - minimum) / (maximum - minimum + 1e-8)
-
-    if mode == "auto":
-        if np.issubdtype(original_dtype, np.integer):
-            maximum = float(np.iinfo(original_dtype).max)
-            return array / maximum
-
-        finite_max = float(np.nanmax(array))
-        finite_min = float(np.nanmin(array))
-
-        if finite_min >= 0.0 and finite_max <= 1.0 + 1e-6:
-            return array
-
-        if finite_min >= 0.0 and finite_max <= 255.0 + 1e-6:
-            return array / 255.0
-
-        raise ValueError(
-            "Floating RGB values are outside [0,1] and [0,255]. "
-            "Set RGB_NORMALIZATION explicitly for this dataset."
-        )
-
-    raise ValueError(f"Unknown RGB normalization mode: {mode}")
+        lo = cube.min(axis=(1, 2), keepdims=True)
+        hi = cube.max(axis=(1, 2), keepdims=True)
+        return (cube - lo) / (hi - lo + 1e-8)
+    raise ValueError(f"Unknown normalization mode: {mode}")
 
 
-def pad_to_patch_size(tensor: torch.Tensor, patch_size: int) -> torch.Tensor:
-    """Input shape: [C,H,W]."""
-    _, height, width = tensor.shape
-    pad_height = max(0, patch_size - height)
-    pad_width = max(0, patch_size - width)
-
-    if pad_height == 0 and pad_width == 0:
-        return tensor
-
-    return F.pad(
-        tensor,
-        pad=(0, pad_width, 0, pad_height),
-        mode="replicate",
-    )
+def pad_to_patch_size(cube: torch.Tensor, patch_size: int) -> torch.Tensor:
+    _, h, w = cube.shape
+    ph = max(0, patch_size - h)
+    pw = max(0, patch_size - w)
+    if ph == 0 and pw == 0:
+        return cube
+    return F.pad(cube, (0, pw, 0, ph), mode="replicate")
 
 
-def random_crop(tensor: torch.Tensor, patch_size: int) -> torch.Tensor:
-    tensor = pad_to_patch_size(tensor, patch_size)
-    _, height, width = tensor.shape
+def random_crop_pair(
+    hsi: torch.Tensor,
+    rgb: torch.Tensor,
+    patch_size: int,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Crop HSI and RGB at the same spatial location."""
+    hsi = pad_to_patch_size(hsi, patch_size)
+    rgb = pad_to_patch_size(rgb, patch_size)
 
-    top = random.randint(0, height - patch_size)
-    left = random.randint(0, width - patch_size)
+    _, h, w = hsi.shape
+    top  = random.randint(0, h - patch_size)
+    left = random.randint(0, w - patch_size)
 
-    return tensor[:, top : top + patch_size, left : left + patch_size]
-
-
-def center_crop(tensor: torch.Tensor, patch_size: int) -> torch.Tensor:
-    tensor = pad_to_patch_size(tensor, patch_size)
-    _, height, width = tensor.shape
-
-    top = (height - patch_size) // 2
-    left = (width - patch_size) // 2
-
-    return tensor[:, top : top + patch_size, left : left + patch_size]
+    hsi = hsi[:, top:top + patch_size, left:left + patch_size]
+    rgb = rgb[:, top:top + patch_size, left:left + patch_size]
+    return hsi, rgb
 
 
-def spatial_augmentation(tensor: torch.Tensor) -> torch.Tensor:
+def center_crop_pair(
+    hsi: torch.Tensor,
+    rgb: torch.Tensor,
+    patch_size: int,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    hsi = pad_to_patch_size(hsi, patch_size)
+    rgb = pad_to_patch_size(rgb, patch_size)
+
+    _, h, w = hsi.shape
+    top  = (h - patch_size) // 2
+    left = (w - patch_size) // 2
+
+    hsi = hsi[:, top:top + patch_size, left:left + patch_size]
+    rgb = rgb[:, top:top + patch_size, left:left + patch_size]
+    return hsi, rgb
+
+
+def spatial_augmentation_pair(
+    hsi: torch.Tensor,
+    rgb: torch.Tensor,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Apply the same random flip / rotation to both modalities."""
     if random.random() < 0.5:
-        tensor = torch.flip(tensor, dims=[1])
+        hsi = torch.flip(hsi, dims=[1])
+        rgb = torch.flip(rgb, dims=[1])
     if random.random() < 0.5:
-        tensor = torch.flip(tensor, dims=[2])
-
-    number_of_rotations = random.randint(0, 3)
-    if number_of_rotations > 0:
-        tensor = torch.rot90(
-            tensor,
-            k=number_of_rotations,
-            dims=[1, 2],
-        )
-
-    return tensor.contiguous()
+        hsi = torch.flip(hsi, dims=[2])
+        rgb = torch.flip(rgb, dims=[2])
+    k = random.randint(0, 3)
+    if k > 0:
+        hsi = torch.rot90(hsi, k=k, dims=[1, 2])
+        rgb = torch.rot90(rgb, k=k, dims=[1, 2])
+    return hsi.contiguous(), rgb.contiguous()
 
 
 # ============================================================
 # Dataset
 # ============================================================
 
-
-class HSIPatchDataset(Dataset):
-    """The supplied HSI dataset with paired RGB added.
-
-    The crop and augmentation code remains unchanged. RGB and HSI are
-    concatenated temporarily so they receive exactly the same spatial crop,
-    flips and rotations, then split back into separate tensors.
-    """
-
+class HSIRGBPairDataset(Dataset):
     def __init__(
         self,
-        paired_files: Sequence[Tuple[Path, Path]],
+        pairs: List[Tuple[Path, Path]],
         hsi_channels: int,
         patch_size: int,
         patches_per_image: int,
         training: bool,
-        hsi_normalization: str,
-        rgb_normalization: str,
+        normalization: str,
         augment: bool,
-    ) -> None:
-        self.paired_files = list(paired_files)
-        self.hsi_channels = hsi_channels
-        self.patch_size = patch_size
+    ):
+        self.pairs             = pairs
+        self.hsi_channels      = hsi_channels
+        self.patch_size        = patch_size
         self.patches_per_image = patches_per_image
-        self.training = training
-        self.hsi_normalization = hsi_normalization
-        self.rgb_normalization = rgb_normalization
-        self.augment = augment
+        self.training          = training
+        self.normalization     = normalization
+        self.augment           = augment
 
     def __len__(self) -> int:
         if self.training:
-            return len(self.paired_files) * self.patches_per_image
-        return len(self.paired_files)
+            return len(self.pairs) * self.patches_per_image
+        return len(self.pairs)
 
     def __getitem__(self, index: int) -> Tuple[torch.Tensor, torch.Tensor]:
+        file_index = index // self.patches_per_image if self.training else index
+        hsi_path, rgb_path = self.pairs[file_index]
+
+        # ── Load HSI ──────────────────────────────────────────────────────────
+        cube = load_hsi_file(hsi_path)
+        cube = convert_to_chw(cube, self.hsi_channels, hsi_path)
+
+        if not np.isfinite(cube).all():
+            raise ValueError(f"NaN or Inf values in {hsi_path}")
+
+        cube = normalize_cube(cube, self.normalization)
+        hsi  = torch.from_numpy(cube.copy()).float()
+
+        # ── Load RGB ──────────────────────────────────────────────────────────
+        rgb_array = load_rgb_file(rgb_path)              # (3, H, W) float32 [0,1]
+        rgb       = torch.from_numpy(rgb_array.copy()).float()
+
+        # ── Crop + augment (same transform for both) ──────────────────────────
         if self.training:
-            file_index = index // self.patches_per_image
-        else:
-            file_index = index
-
-        hsi_path, rgb_path = self.paired_files[file_index]
-
-        hsi = load_hsi_file(hsi_path)
-        hsi = convert_hsi_to_chw(hsi, self.hsi_channels, hsi_path)
-
-        rgb = load_rgb_file(rgb_path)
-        rgb = convert_rgb_to_chw(rgb, rgb_path)
-
-        if not np.isfinite(hsi).all():
-            raise ValueError(f"NaN or infinite values found in {hsi_path}")
-        if not np.isfinite(rgb).all():
-            raise ValueError(f"NaN or infinite values found in {rgb_path}")
-
-        hsi = normalize_cube(hsi, self.hsi_normalization)
-        rgb = normalize_rgb(rgb, self.rgb_normalization)
-
-        hsi_tensor = torch.from_numpy(hsi.copy()).float()
-        rgb_tensor = torch.from_numpy(rgb.copy()).float()
-
-        if hsi_tensor.shape[-2:] != rgb_tensor.shape[-2:]:
-            raise ValueError(
-                "Paired RGB and HSI spatial sizes differ:\n"
-                f"  HSI: {hsi_path} -> {tuple(hsi_tensor.shape)}\n"
-                f"  RGB: {rgb_path} -> {tuple(rgb_tensor.shape)}\n"
-                "Align the pairs before training rather than silently resizing."
-            )
-
-        # Concatenation is the only change needed to reuse exactly the same
-        # crop and augmentation functions for the pair.
-        combined = torch.cat([hsi_tensor, rgb_tensor], dim=0)
-
-        if self.training:
-            combined = random_crop(combined, self.patch_size)
+            hsi, rgb = random_crop_pair(hsi, rgb, self.patch_size)
             if self.augment:
-                combined = spatial_augmentation(combined)
+                hsi, rgb = spatial_augmentation_pair(hsi, rgb)
         else:
-            combined = center_crop(combined, self.patch_size)
+            hsi, rgb = center_crop_pair(hsi, rgb, self.patch_size)
 
-        hsi_tensor = combined[: self.hsi_channels]
-        rgb_tensor = combined[self.hsi_channels : self.hsi_channels + 3]
-
-        return rgb_tensor, hsi_tensor
+        return hsi, rgb
 
 
 # ============================================================
-# Train-validation split
+# Train / validation split
 # ============================================================
-
 
 def split_pairs(
     pairs: List[Tuple[Path, Path]],
@@ -864,525 +549,284 @@ def split_pairs(
         raise ValueError("VALIDATION_FRACTION must be between 0 and 1.")
 
     shuffled = pairs.copy()
-    random_generator = random.Random(seed)
-    random_generator.shuffle(shuffled)
+    random.Random(seed).shuffle(shuffled)
 
-    validation_size = max(1, int(len(shuffled) * validation_fraction))
-    validation_pairs = shuffled[:validation_size]
-    training_pairs = shuffled[validation_size:]
+    val_size  = max(1, int(len(shuffled) * validation_fraction))
+    val_pairs = shuffled[:val_size]
+    trn_pairs = shuffled[val_size:]
 
-    if not training_pairs:
+    if not trn_pairs:
         raise RuntimeError("No pairs remain for training after splitting.")
 
-    return training_pairs, validation_pairs
+    return trn_pairs, val_pairs
 
 
 # ============================================================
-# Loss and metrics
+# VAE loading
 # ============================================================
 
+def load_pretrained_vae(
+    checkpoint_path: str,
+    device: torch.device,
+) -> HSIVAE:
+    """Load a frozen, pre-trained HSIVAE from a checkpoint."""
+    ckpt = torch.load(checkpoint_path, map_location=device)
 
-def calculate_operator_loss(
-    model: RGBSpectralResponse,
-    hsi: torch.Tensor,
-    rgb: torch.Tensor,
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    rgb_hat = model(hsi)
-    rgb_mse = F.mse_loss(rgb_hat, rgb)
-    smoothness = model.smoothness_regularizer()
-    total = rgb_mse + OPERATOR_SMOOTHNESS_WEIGHT * smoothness
-    return total, rgb_mse, smoothness, rgb_hat
+    cfg = ckpt.get("model_config", {})
+    vae = HSIVAE(
+        hsi_channels  = cfg.get("hsi_channels",  HSI_CHANNELS),
+        base_channels = cfg.get("base_channels",  BASE_CHANNELS),
+        latent_channels = cfg.get("latent_channels", LATENT_CHANNELS),
+        num_res_blocks = cfg.get("num_res_blocks",  NUM_RES_BLOCKS),
+    )
+
+    vae.load_state_dict(ckpt["model_state_dict"])
+    vae.eval()
+
+    for param in vae.parameters():
+        param.requires_grad_(False)
+
+    return vae.to(device)
 
 
-@torch.no_grad()
-def calculate_rgb_metrics(
-    rgb_hat: torch.Tensor,
-    rgb: torch.Tensor,
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    mse = F.mse_loss(rgb_hat, rgb)
-    mae = F.l1_loss(rgb_hat, rgb)
-    psnr = 10.0 * torch.log10(1.0 / mse.clamp_min(1e-12))
-    return mse, mae, psnr
+# ============================================================
+# Metrics (pixel-space, computed from decoded HSI)
+# ============================================================
 
-@torch.no_grad()
 def calculate_aux_losses(
     reconstruction: torch.Tensor,
     target: torch.Tensor,
-) -> tuple[
-    torch.Tensor,
-    torch.Tensor,
-    torch.Tensor,
-    torch.Tensor,
-    torch.Tensor,
-]:
-    """
-    Calculate evaluation metrics.
-
-    In the RGB-operator training stage:
-        reconstruction = predicted RGB, shape [B, 3, H, W]
-        target         = ground-truth RGB, shape [B, 3, H, W]
-
-    These are reporting metrics only and do not contribute to backpropagation.
-    """
-
-    # Convert to float32 because metric calculations can be unstable
-    # under float16 mixed precision.
-    reconstruction = reconstruction.float()
-    target = target.float()
-
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     mrae_value = mrae(target, reconstruction)
     rmse_value = rmse(target, reconstruction)
-    sam_value = sam(target, reconstruction)
-    psnr_value = custom_psnr(target, reconstruction)
+    sam_value  = sam(target, reconstruction)
+    psnr_value = psnr(target, reconstruction)
     ssim_value = ssim(target, reconstruction)
+    return mrae_value, rmse_value, sam_value, psnr_value, ssim_value
 
-    return (
-        mrae_value,
-        rmse_value,
-        sam_value,
-        psnr_value,
-        ssim_value,
-    )
-    
+
 # ============================================================
 # Training
 # ============================================================
 
-
 def train_one_epoch(
-    model: HSIVAE,
+    model: RGB_to_HSI_w_diffusion,
     loader: DataLoader,
     optimizer: torch.optim.Optimizer,
     scaler: GradScaler,
+    noise_scheduler: DDPMScheduler,
     device: torch.device,
     use_amp: bool,
 ) -> dict:
     model.train()
 
-    total_loss = 0.0
-    total_reconstruction = 0.0
-    total_kl = 0.0
-    total_mrae = 0.0
-    total_rmse = 0.0
-    total_sam = 0.0
-    total_psnr = 0.0
-    total_ssim = 0.0
+    total_noise_loss = 0.0
+    total_mrae = total_rmse = total_sam = total_psnr = total_ssim = 0.0
     total_samples = 0
 
-    for batch_index, hsi in enumerate(loader, start=1):
-        hsi = hsi.to(
-            device,
-            non_blocking=True,
+    for batch_index, (hsi, rgb) in enumerate(loader, start=1):
+        hsi = hsi.to(device, non_blocking=True)
+        rgb = rgb.to(device, non_blocking=True)
+
+        # Sample random timesteps for each item in the batch.
+        t = torch.randint(
+            0,
+            noise_scheduler.config.num_train_timesteps,
+            (hsi.size(0),),
+            device=device,
         )
 
-        optimizer.zero_grad(
-            set_to_none=True
-        )
+        optimizer.zero_grad(set_to_none=True)
 
         with autocast(enabled=use_amp):
-            reconstruction, mu, logvar, _ = model(
-                hsi,
-                sample=True,
-            )
-
-            (
-                loss,
-                reconstruction_value,
-                kl_value,
-            ) = calculate_vae_loss(
-                reconstruction=reconstruction,
-                target=hsi,
-                mu=mu,
-                logvar=logvar,
-            )
-            
+            loss, hsi_recon, _ = model(hsi, rgb, t, noise_scheduler)
 
         if not torch.isfinite(loss):
-            raise FloatingPointError(
-                f"Non-finite training loss: {loss.item()}"
-            )
+            raise FloatingPointError(f"Non-finite training loss: {loss.item()}")
 
         scaler.scale(loss).backward()
-
         scaler.unscale_(optimizer)
-
         torch.nn.utils.clip_grad_norm_(
-            model.parameters(),
-            max_norm=GRADIENT_CLIP_NORM,
+            model.dit.parameters(), max_norm=GRADIENT_CLIP_NORM
         )
-
         scaler.step(optimizer)
         scaler.update()
+
         with torch.no_grad():
-            (
-                mrae_value,
-                rmse_value,
-                sam_value,
-                psnr_value,
-                ssim_value,
-            ) = calculate_aux_losses(
-                reconstruction=reconstruction.detach(),
-                target=hsi.detach(),
-                mu=mu.detach(),
-                logvar=logvar.detach(),
+            mrae_v, rmse_v, sam_v, psnr_v, ssim_v = calculate_aux_losses(
+                hsi_recon.detach(), hsi.detach()
             )
 
         batch_size = hsi.size(0)
-
-        total_loss += (
-            loss.detach().item()
-            * batch_size
-        )
-
-        total_reconstruction += (
-            reconstruction_value.detach().item()
-            * batch_size
-        )
-
-        total_kl += (
-            kl_value.detach().item()
-            * batch_size
-        )
-        total_mrae += (
-            mrae_value.detach().item()
-            * batch_size
-        )
-        
-        total_rmse += (
-            rmse_value.detach().item()
-            * batch_size
-        )
-        
-        total_sam += (
-            sam_value.detach().item()
-            * batch_size
-        )
-        
-        total_psnr += (
-            psnr_value.detach().item()
-            * batch_size
-        )
-        
-        total_ssim += (
-            ssim_value.detach().item()
-            * batch_size
-        )
-
+        total_noise_loss += loss.detach().item() * batch_size
+        total_mrae  += mrae_v.item() * batch_size
+        total_rmse  += rmse_v.item() * batch_size
+        total_sam   += sam_v.item()  * batch_size
+        total_psnr  += psnr_v.item() * batch_size
+        total_ssim  += ssim_v.item() * batch_size
         total_samples += batch_size
-        if (
-            batch_index % PRINT_EVERY == 0
-            or batch_index == len(loader)
-        ):
-            average_total_loss = (
-                total_loss / total_samples
-            )
-        
-            average_reconstruction_loss = (
-                total_reconstruction / total_samples
-            )
-        
-            average_kl_loss = (
-                total_kl / total_samples
-            )
-            
-            average_mrae_loss = (
-                total_mrae / total_samples
-            )
-            
-            average_rmse_loss = (
-                total_rmse / total_samples
-            )
-            
-            average_sam_loss = (
-                total_sam / total_samples
-            )
-            
-            average_psnr_loss = (
-                total_psnr / total_samples
-            )
-            
-            average_ssim_loss = (
-                total_ssim / total_samples
-            )
-            
-        
+
+        if batch_index % PRINT_EVERY == 0 or batch_index == len(loader):
+            n = total_samples
             print(
                 f"  Batch {batch_index:04d}/{len(loader):04d} | "
-                f"Running total: {average_total_loss:.6f} | "
-                f"Running recon: "
-                f"{average_reconstruction_loss:.6f} | "
-                f"Running KL: {average_kl_loss:.6f}"
-                f" Running MRAE: {average_mrae_loss:.6f}"
-                f" Running RMSE: {average_rmse_loss:.6f}"
-                f" Running SAM: {average_sam_loss:.6f}"
-                f" Running PSNR: {average_psnr_loss:.6f}"
-                f" Running SSIM: {average_ssim_loss:.6f}"
+                f"Noise loss: {total_noise_loss / n:.6f} | "
+                f"MRAE: {total_mrae / n:.6f} | "
+                f"RMSE: {total_rmse / n:.6f} | "
+                f"SAM: {total_sam / n:.6f} | "
+                f"PSNR: {total_psnr / n:.4f} | "
+                f"SSIM: {total_ssim / n:.4f}"
             )
 
+    n = total_samples
     return {
-        "loss": (
-            total_loss
-            / total_samples
-        ),
-        "reconstruction": (
-            total_reconstruction
-            / total_samples
-        ),
-        "kl": (
-            total_kl
-            / total_samples
-        ),
-        "mrae": (
-            total_mrae
-            / total_samples
-        ),
-        "rmse": (
-            total_rmse
-            / total_samples
-        ),
-        "sam": (
-            total_sam
-            / total_samples
-        ),
-        "psnr": (
-            total_psnr
-            / total_samples
-        ),
-        "ssim": (
-            total_ssim
-            / total_samples
-        ),
+        "noise_loss": total_noise_loss / n,
+        "mrae":  total_mrae  / n,
+        "rmse":  total_rmse  / n,
+        "sam":   total_sam   / n,
+        "psnr":  total_psnr  / n,
+        "ssim":  total_ssim  / n,
     }
 
 
 @torch.no_grad()
 def validate(
-    model: HSIVAE,
+    model: RGB_to_HSI_w_diffusion,
     loader: DataLoader,
+    noise_scheduler: DDPMScheduler,
     device: torch.device,
     use_amp: bool,
 ) -> dict:
     model.eval()
 
-    total_loss = 0.0
-    total_reconstruction = 0.0
-    total_kl = 0.0
-    total_mrae = 0.0
-    total_rmse = 0.0
-    total_sam = 0.0
-    total_psnr = 0.0
-    total_ssim = 0.0
+    total_noise_loss = 0.0
+    total_mrae = total_rmse = total_sam = total_psnr = total_ssim = 0.0
     total_samples = 0
 
-    for hsi in loader:
-        hsi = hsi.to(
-            device,
-            non_blocking=True,
+    for hsi, rgb in loader:
+        hsi = hsi.to(device, non_blocking=True)
+        rgb = rgb.to(device, non_blocking=True)
+
+        t = torch.randint(
+            0,
+            noise_scheduler.config.num_train_timesteps,
+            (hsi.size(0),),
+            device=device,
         )
 
         with autocast(enabled=use_amp):
-            # Use the posterior mean during validation.
-            reconstruction, mu, logvar, _ = model(
-                hsi,
-                sample=False,
-            )
+            loss, hsi_recon, _ = model(hsi, rgb, t, noise_scheduler)
 
-            (
-                loss,
-                reconstruction_value,
-                kl_value,
-            ) = calculate_vae_loss(
-                reconstruction=reconstruction,
-                target=hsi,
-                mu=mu,
-                logvar=logvar,
-            )
-            mrae_value,rmse_value,sam_value,psnr_value,ssim_value = calculate_aux_losses (reconstruction = reconstruction,target = hsi,mu = mu,logvar = logvar)
+        mrae_v, rmse_v, sam_v, psnr_v, ssim_v = calculate_aux_losses(
+            hsi_recon, hsi
+        )
 
         batch_size = hsi.size(0)
-
-        total_loss += (
-            loss.item()
-            * batch_size
-        )
-
-        total_reconstruction += (
-            reconstruction_value.item()
-            * batch_size
-        )
-
-        total_kl += (
-            kl_value.item()
-            * batch_size
-        )
-        total_mrae += (
-            mrae_value.detach().item()
-            * batch_size
-        )
-        total_rmse += (
-            rmse_value.detach().item()
-            * batch_size
-        )
-        total_sam += (
-            sam_value.detach().item()
-            * batch_size
-        )
-        total_psnr += (
-            psnr_value.detach().item()
-            * batch_size
-        )
-        total_ssim += (
-            ssim_value.detach().item()
-            * batch_size
-        )
-
+        total_noise_loss += loss.item() * batch_size
+        total_mrae  += mrae_v.item() * batch_size
+        total_rmse  += rmse_v.item() * batch_size
+        total_sam   += sam_v.item()  * batch_size
+        total_psnr  += psnr_v.item() * batch_size
+        total_ssim  += ssim_v.item() * batch_size
         total_samples += batch_size
 
+    n = total_samples
     return {
-        "loss": (
-            total_loss
-            / total_samples
-        ),
-        "reconstruction": (
-            total_reconstruction
-            / total_samples
-        ),
-        "kl": (
-            total_kl
-            / total_samples
-        ),
-        "mrae": (
-            total_mrae
-            / total_samples
-        ),
-        "rmse": (
-            total_rmse
-            / total_samples
-        ),
-        "sam": (
-            total_sam
-            / total_samples
-        ),
-        "psnr": (
-            total_psnr
-            / total_samples
-        ),
-        "ssim": (
-            total_ssim
-            / total_samples
-        ),
+        "noise_loss": total_noise_loss / n,
+        "mrae":  total_mrae  / n,
+        "rmse":  total_rmse  / n,
+        "sam":   total_sam   / n,
+        "psnr":  total_psnr  / n,
+        "ssim":  total_ssim  / n,
     }
-
 
 
 # ============================================================
 # Checkpoint saving
 # ============================================================
 
-
 def save_checkpoint(
     output_path: Path,
-    model: RGBSpectralResponse,
+    model: RGB_to_HSI_w_diffusion,
     optimizer: torch.optim.Optimizer,
-    scheduler: torch.optim.lr_scheduler.LRScheduler,
     epoch: int,
-    validation_metrics: dict,
+    validation_loss: float,
 ) -> None:
+
     output_path.parent.mkdir(parents=True, exist_ok=True)
-
-    with torch.no_grad():
-        weight = model.weight.detach().cpu()
-        singular_values = torch.linalg.svdvals(weight)
-
     torch.save(
         {
             "epoch": epoch,
-            "operator_state_dict": model.state_dict(),
+            "dit_state_dict": model.dit.state_dict(),
+            "vae_state_dict": model.vae.state_dict(),  # ← added
             "optimizer_state_dict": optimizer.state_dict(),
-            "scheduler_state_dict": scheduler.state_dict(),
-            "validation_metrics": validation_metrics,
-            "operator_weight": weight,
-            "operator_singular_values": singular_values,
+            "validation_loss": validation_loss,
             "model_config": {
-                "bands": HSI_CHANNELS,
-                "constrain_nonnegative": CONSTRAIN_OPERATOR_NONNEGATIVE,
-            },
-            "data_config": {
-                "hsi_normalization": HSI_NORMALIZATION,
-                "rgb_normalization": RGB_NORMALIZATION,
-                "patch_size": PATCH_SIZE,
+                "hsi_channels":    HSI_CHANNELS,
+                "base_channels":   BASE_CHANNELS,
+                "latent_channels": LATENT_CHANNELS,
+                "num_res_blocks":  NUM_RES_BLOCKS,
+                "hidden_size":     HIDDEN_SIZE,
+                "depth":           DEPTH,
+                "num_heads":       NUM_HEADS,
+                "mlp_ratio":       MLP_RATIO,
+                "patch_size":      PATCH_SIZE,
+                "input_size":      INPUT_SIZE,
+                "learn_sigma":     LEARN_SIGMA,
             },
         },
         output_path,
     )
 
-    # Also save the actual 3 x K response matrix in a directly inspectable form.
-    np.save(
-        output_path.with_suffix(".npy"),
-        weight.numpy(),
-    )
-
-
 # ============================================================
 # Main
 # ============================================================
 
-
 def main() -> None:
     set_seed(SEED)
 
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    device  = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     use_amp = USE_AMP and device.type == "cuda"
 
     output_dir = Path(OUTPUT_DIR)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    all_hsi_files = find_hsi_files(HSI_DATA_DIR)
-    all_hsi_files = filter_valid_hsi_files(
-        files=all_hsi_files,
+    # ── Data ─────────────────────────────────────────────────────────────────
+    all_pairs = pair_hsi_rgb_files(HSI_DATA_DIR, RGB_DATA_DIR)
+    all_pairs = filter_valid_pairs(
+        pairs=all_pairs,
         hsi_channels=HSI_CHANNELS,
         log_path=output_dir / "invalid_hsi_files.txt",
     )
+    train_pairs, val_pairs = split_pairs(all_pairs, VALIDATION_FRACTION, SEED)
 
-    all_pairs = build_paired_files(all_hsi_files)
-    training_pairs, validation_pairs = split_pairs(
-        pairs=all_pairs,
-        validation_fraction=VALIDATION_FRACTION,
-        seed=SEED,
-    )
-
-    print(f"Device: {device}")
+    print(f"\nDevice: {device}")
     print(f"Mixed precision: {use_amp}")
-    print(f"Total paired images: {len(all_pairs)}")
-    print(f"Training pairs: {len(training_pairs)}")
-    print(f"Validation pairs: {len(validation_pairs)}")
+    print(f"Total pairs: {len(all_pairs)}")
+    print(f"Training pairs: {len(train_pairs)}")
+    print(f"Validation pairs: {len(val_pairs)}")
 
-    training_dataset = HSIPatchDataset(
-        paired_files=training_pairs,
+    train_dataset = HSIRGBPairDataset(
+        pairs=train_pairs,
         hsi_channels=HSI_CHANNELS,
-        patch_size=PATCH_SIZE,
+        patch_size=PATCH_SIZE_PX,
         patches_per_image=PATCHES_PER_IMAGE,
         training=True,
-        hsi_normalization=HSI_NORMALIZATION,
-        rgb_normalization=RGB_NORMALIZATION,
+        normalization="none",
         augment=USE_AUGMENTATION,
     )
-
-    validation_dataset = HSIPatchDataset(
-        paired_files=validation_pairs,
+    val_dataset = HSIRGBPairDataset(
+        pairs=val_pairs,
         hsi_channels=HSI_CHANNELS,
-        patch_size=PATCH_SIZE,
+        patch_size=PATCH_SIZE_PX,
         patches_per_image=1,
         training=False,
-        hsi_normalization=HSI_NORMALIZATION,
-        rgb_normalization=RGB_NORMALIZATION,
+        normalization="none",
         augment=False,
     )
 
-    # DataLoader construction is unchanged from the supplied script. The
-    # dataset now simply returns (rgb, hsi) rather than hsi alone.
-    training_loader = DataLoader(
-        training_dataset,
+    train_loader = DataLoader(
+        train_dataset,
         batch_size=BATCH_SIZE,
         shuffle=True,
         num_workers=NUM_WORKERS,
@@ -1390,9 +834,8 @@ def main() -> None:
         drop_last=True,
         persistent_workers=NUM_WORKERS > 0,
     )
-
-    validation_loader = DataLoader(
-        validation_dataset,
+    val_loader = DataLoader(
+        val_dataset,
         batch_size=BATCH_SIZE,
         shuffle=False,
         num_workers=NUM_WORKERS,
@@ -1401,98 +844,108 @@ def main() -> None:
         persistent_workers=NUM_WORKERS > 0,
     )
 
-    model = RGBSpectralResponse(
-        bands=HSI_CHANNELS,
-        constrain_nonnegative=CONSTRAIN_OPERATOR_NONNEGATIVE,
+    # ── Model ─────────────────────────────────────────────────────────────────
+    pretrained_vae = load_pretrained_vae(VAE_CHECKPOINT, device)
+
+    model = RGB_to_HSI_w_diffusion(
+        hsi_channels=HSI_CHANNELS,
+        base_channels=BASE_CHANNELS,
+        latent_channels=LATENT_CHANNELS,
+        num_res_blocks=NUM_RES_BLOCKS,
+        hidden_size=HIDDEN_SIZE,
+        depth=DEPTH,
+        num_heads=NUM_HEADS,
+        mlp_ratio=MLP_RATIO,
+        learn_sigma=LEARN_SIGMA,
+        patch_size=PATCH_SIZE,
+        input_size=INPUT_SIZE,
     ).to(device)
 
+    # Replace the randomly-initialised VAE inside the model with the
+    # pre-trained one we just loaded (already frozen).
+    model.vae = pretrained_vae
+
+    # Only the DiT is trainable.
+    trainable_params = list(model.dit.parameters())
+    print(
+        f"\nTrainable parameters: "
+        f"{sum(p.numel() for p in trainable_params):,}"
+    )
+
+    # ── Noise scheduler ───────────────────────────────────────────────────────
+    noise_scheduler = DDPMScheduler(
+        num_train_timesteps=NUM_TRAIN_TIMESTEPS,
+        beta_schedule=BETA_SCHEDULE,
+    )
+
+    # ── Optimiser and LR scheduler ────────────────────────────────────────────
     optimizer = torch.optim.AdamW(
-        model.parameters(),
+        trainable_params,
         lr=LEARNING_RATE,
         weight_decay=WEIGHT_DECAY,
     )
-
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+    lr_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
         optimizer,
         T_max=NUM_EPOCHS,
         eta_min=1e-7,
     )
-
     scaler = GradScaler(enabled=use_amp)
 
-    best_validation_mse = float("inf")
+    best_val_loss = float("inf")
 
+    # ── Training loop ─────────────────────────────────────────────────────────
     for epoch in range(1, NUM_EPOCHS + 1):
-        training_metrics = train_one_epoch(
+        train_metrics = train_one_epoch(
             model=model,
-            loader=training_loader,
+            loader=train_loader,
             optimizer=optimizer,
             scaler=scaler,
+            noise_scheduler=noise_scheduler,
             device=device,
             use_amp=use_amp,
         )
-
-        validation_metrics = validate(
+        val_metrics = validate(
             model=model,
-            loader=validation_loader,
+            loader=val_loader,
+            noise_scheduler=noise_scheduler,
             device=device,
             use_amp=use_amp,
         )
+        lr_scheduler.step()
 
-        # CosineAnnealingLR does not take a validation loss argument.
-        scheduler.step()
-
-        current_learning_rate = optimizer.param_groups[0]["lr"]
-
-        with torch.no_grad():
-            singular_values = torch.linalg.svdvals(model.weight.detach()).cpu()
-
+        current_lr = optimizer.param_groups[0]["lr"]
         print(
-            f"Epoch {epoch:03d}/{NUM_EPOCHS:03d} | "
-            f"LR: {current_learning_rate:.2e} | "
-            f"Train total: {training_metrics['loss']:.8f} | "
-            f"Train RGB MSE: {training_metrics['rgb_mse']:.8f} | "
-            f"Train RGB PSNR: {training_metrics['rgb_psnr']:.3f} dB | "
-            f"Val total: {validation_metrics['loss']:.8f} | "
-            f"Val RGB MSE: {validation_metrics['rgb_mse']:.8f} | "
-            f"Val RGB MAE: {validation_metrics['rgb_mae']:.6f} | "
-            f"Val RGB PSNR: {validation_metrics['rgb_psnr']:.3f} dB"
+            f"\nEpoch {epoch:03d}/{NUM_EPOCHS:03d} | "
+            f"LR: {current_lr:.2e} | "
+            f"Train noise loss: {train_metrics['noise_loss']:.6f} | "
+            f"Val noise loss:   {val_metrics['noise_loss']:.6f} | "
+            f"Val MRAE: {val_metrics['mrae']:.6f} | "
+            f"Val RMSE: {val_metrics['rmse']:.6f} | "
+            f"Val SAM:  {val_metrics['sam']:.6f} | "
+            f"Val PSNR: {val_metrics['psnr']:.4f} | "
+            f"Val SSIM: {val_metrics['ssim']:.4f}"
         )
-        print(f"  Operator singular values: {singular_values.tolist()}")
 
+        # Always save latest.
         save_checkpoint(
-            output_path=output_dir / "last_rgb_operator.pth",
+            output_path=output_dir / "last_diffusion.pth",
             model=model,
             optimizer=optimizer,
-            scheduler=scheduler,
             epoch=epoch,
-            validation_metrics=validation_metrics,
+            validation_loss=val_metrics["noise_loss"],
         )
 
-        if validation_metrics["rgb_mse"] < best_validation_mse:
-            best_validation_mse = validation_metrics["rgb_mse"]
-
+        # Save best by validation noise loss.
+        if val_metrics["noise_loss"] < best_val_loss:
+            best_val_loss = val_metrics["noise_loss"]
             save_checkpoint(
-                output_path=output_dir / "best_rgb_operator.pth",
+                output_path=output_dir / "best_diffusion.pth",
                 model=model,
                 optimizer=optimizer,
-                scheduler=scheduler,
                 epoch=epoch,
-                validation_metrics=validation_metrics,
+                validation_loss=best_val_loss,
             )
-
-            print(
-                "Saved new best RGB operator checkpoint: "
-                f"MSE={best_validation_mse:.8f}"
-            )
-
-    print("\nTraining complete.")
-    print(f"Best operator: {output_dir / 'best_rgb_operator.pth'}")
-    print(
-        "Next, load this operator into RGBDDS2M, freeze it, and optimize a "
-        "fresh VS2M generator separately for each RGB image during reverse "
-        "diffusion."
-    )
+            print(f"  ✓ New best checkpoint: {best_val_loss:.6f}")
 
 
 if __name__ == "__main__":
