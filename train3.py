@@ -770,26 +770,27 @@ def train_one_epoch(
     total_noise_loss = 0.0
     total_mrae = total_rmse = total_sam = total_psnr = total_ssim = 0.0
     total_samples = 0
-
+    trainable_params = list(model.dit.parameters())
+    
     for batch_index, (hsi, rgb) in enumerate(loader, start=1):
         hsi = hsi.to(device, non_blocking=True)
         rgb = rgb.to(device, non_blocking=True)
 
         # Sample random timesteps for each item in the batch.
-        #t = torch.randint(
-           # 0,
-            #noise_scheduler.config.num_train_timesteps,
-            #(hsi.size(0),),
-            #device=device,
-        #)
+        t = torch.randint(
+            0,
+            noise_scheduler.config.num_train_timesteps,
+            (hsi.size(0),),
+            device=device,
+        )
 
         # After
-        t = sample_logit_normal_timesteps(
-            batch_size=hsi.size(0),
-            device=device,
-            m=0.0,   # adjust to bias toward noisier (m < 0) or cleaner (m > 0) timesteps
-            s=1.0,
-        )
+        #t = sample_logit_normal_timesteps(
+            #batch_size=hsi.size(0),
+            #device=device,
+            #m=0.0,   # adjust to bias toward noisier (m < 0) or cleaner (m > 0) timesteps
+            #s=1.0,
+        #)
 
         optimizer.zero_grad(set_to_none=True)
 
@@ -802,7 +803,7 @@ def train_one_epoch(
         scaler.scale(loss).backward()
         scaler.unscale_(optimizer)
         torch.nn.utils.clip_grad_norm_(
-            model.dit.parameters(), max_norm=GRADIENT_CLIP_NORM
+            trainable_params, max_norm=GRADIENT_CLIP_NORM
         )
         scaler.step(optimizer)
         scaler.update()
