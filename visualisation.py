@@ -9,7 +9,7 @@ import scipy.io as sio
 import torch
 import torch.nn.functional as F
 
-from models.HSI_VAE import HSIVAE
+from models.diffusion_DiT import rgb_to_hsi_w_diffusion
 
 
 # ============================================================
