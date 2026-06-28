@@ -1050,7 +1050,7 @@ def main() -> None:
 
     best_val_loss = float("inf")
 
-    l_mean,l_std = compute_latent_statistics (pretained_vae,loader,device)
+    l_mean,l_std = compute_latent_statistics (pretrained_vae,loader,device)
     print(l_mean)
     print(l_std)
     print("Stats")
