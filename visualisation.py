@@ -9,7 +9,7 @@ import scipy.io as sio
 import torch
 import torch.nn.functional as F
 
-from models.diffusion_DiT import rgb_to_hsi_w_diffusion
+from models.diffusion_DiT import RGB_to_HSI_w_diffusion
 
 
 # ============================================================
