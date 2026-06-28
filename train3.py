@@ -1050,11 +1050,7 @@ def main() -> None:
 
     best_val_loss = float("inf")
 
-    print("Checking stats of vae")
-    l_mean,l_std = compute_latent_statistics (pretrained_vae,val_loader,device)
-    print(l_mean)
-    print(l_std)
-    print("Stats")
+    
     # ── Training loop ─────────────────────────────────────────────────────────
     for epoch in range(1, NUM_EPOCHS + 1):
         train_metrics = train_one_epoch(
@@ -1108,20 +1104,6 @@ def main() -> None:
                 validation_loss=best_val_loss,
             )
             print(f"  ✓ New best checkpoint: {best_val_loss:.6f}")
-
-@torch.no_grad()
-def compute_latent_statistics(vae, loader, device):
-    all_means = []
-    all_vars  = []
-    for hsi, _ in loader:
-        hsi = hsi.to(device)
-        z, _, _ = vae.encode(hsi, sample=False)  # use mean, no sampling
-        all_means.append(z.mean().item())
-        all_vars.append(z.var().item())
-    latent_mean = np.mean(all_means)
-    latent_std  = np.sqrt(np.mean(all_vars))
-    print(f"Latent mean: {latent_mean:.4f}, std: {latent_std:.4f}")
-    return latent_mean, latent_std
 
 
 if __name__ == "__main__":
