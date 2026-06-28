@@ -60,8 +60,8 @@ NUM_TRAIN_TIMESTEPS = 1000
 BETA_SCHEDULE       = "squaredcos_cap_v2"   # cosine schedule; change to "linear" if preferred
 
 # ── Training ──────────────────────────────────────────────────────────────────
-PATCH_SIZE_PX      = 64    # spatial crop size fed to the model (pixels)
-PATCHES_PER_IMAGE  = 4
+PATCH_SIZE_PX      = 256    # spatial crop size fed to the model (pixels)
+PATCHES_PER_IMAGE  = 1
 
 BATCH_SIZE     = 4
 NUM_EPOCHS     = 75
@@ -71,7 +71,7 @@ WEIGHT_DECAY   = 1e-4
 VALIDATION_FRACTION = 0.1
 NUM_WORKERS         = 4
 USE_AMP             = True
-USE_AUGMENTATION    = True
+USE_AUGMENTATION    = False
 
 SEED                = 42
 GRADIENT_CLIP_NORM  = 1.0
@@ -1050,7 +1050,8 @@ def main() -> None:
 
     best_val_loss = float("inf")
 
-    l_mean,l_std = compute_latent_statistics (pretrained_vae,train_loader,device)
+    print("Checking stats of vae")
+    l_mean,l_std = compute_latent_statistics (pretrained_vae,val_loader,device)
     print(l_mean)
     print(l_std)
     print("Stats")
