@@ -175,9 +175,9 @@ class DiT(nn.Module):
     """
     def __init__(
         self,
-        input_size=32,
-        patch_size=2,
-        in_channels=4,
+        input_size=256,
+        patch_size=4,
+        in_channels=16,
         hidden_size=256,
         depth=12,
         num_heads=4,
@@ -430,15 +430,14 @@ class RGB_to_HSI_w_diffusion(nn.Module):
         
         # ── 2. Sample noise and corrupt z0 → zₜ ─────────────────────────────────
         noise = torch.randn_like(z0)
-        noise_rgb = torch.randn_like(rgb)
+        #noise_rgb = torch.randn_like(rgb)
         #t_idx = (t * (self.T - 1)).long().clamp(0, self.T - 1)   # (B,) int64
         t_idx = t
         
         zt = noise_scheduler.add_noise(z0, noise, t_idx)
         #rgb_t = noise_scheduler.add_noise(rgb,noise_rgb,t_idx)
         # ── 3. DiT predicts noise from zₜ, conditioned on RGB ───────────────────
-        rgb_t = rgb
-        pred = self.dit(zt, t_idx, rgb_t)
+        pred = self.dit(zt, t_idx, rgb)
         
         if self.dit.learn_sigma:
             # DiT outputs [pred_noise | pred_sigma] — only noise half is trained
