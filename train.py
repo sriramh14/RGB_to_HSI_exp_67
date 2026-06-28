@@ -44,7 +44,13 @@ NUM_EPOCHS = 75
 LEARNING_RATE = 1e-4
 WEIGHT_DECAY = 1e-4
 
-KL_WEIGHT = 1e-6
+#KL_WEIGHT = 1e-6
+
+KL_MAX_WEIGHT = 0.1
+
+KL_START_EPOCH = 1
+KL_END_EPOCH = 50      # reach full weight after 30 epochs
+
 VALIDATION_FRACTION = 0.1
 
 # Options:
@@ -956,11 +962,27 @@ def split_files(
 # Loss
 # ============================================================
 
+def get_kl_weight(epoch):
+    if epoch < KL_START_EPOCH:
+        return 0.0
+
+    if epoch >= KL_END_EPOCH:
+        return KL_MAX_WEIGHT
+
+    progress = (
+        (epoch - KL_START_EPOCH)
+        / (KL_END_EPOCH - KL_START_EPOCH)
+    )
+
+    return progress * KL_MAX_WEIGHT
+
+
 def calculate_vae_loss(
     reconstruction: torch.Tensor,
     target: torch.Tensor,
     mu: torch.Tensor,
     logvar: torch.Tensor,
+    KL_WEIGHT,
 ) -> tuple[
     torch.Tensor,
     torch.Tensor,
@@ -1022,6 +1044,7 @@ def train_one_epoch(
     scaler: GradScaler,
     device: torch.device,
     use_amp: bool,
+    epoch,
 ) -> dict:
     model.train()
 
@@ -1035,6 +1058,7 @@ def train_one_epoch(
     total_ssim = 0.0
     total_samples = 0
 
+    kl_weight = get_kl_weight(epoch)
     for batch_index, hsi in enumerate(loader, start=1):
         hsi = hsi.to(
             device,
@@ -1060,6 +1084,7 @@ def train_one_epoch(
                 target=hsi,
                 mu=mu,
                 logvar=logvar,
+                KL_WEIGHT = kl_weight
             )
             
 
@@ -1519,6 +1544,7 @@ def main() -> None:
             scaler=scaler,
             device=device,
             use_amp=use_amp,
+            epoch = epoch
         )
 
         validation_metrics = validate(
