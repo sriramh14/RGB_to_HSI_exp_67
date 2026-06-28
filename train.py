@@ -1252,6 +1252,7 @@ def validate(
     loader: DataLoader,
     device: torch.device,
     use_amp: bool,
+    epoch
 ) -> dict:
     model.eval()
 
@@ -1264,7 +1265,7 @@ def validate(
     total_psnr = 0.0
     total_ssim = 0.0
     total_samples = 0
-
+    kl_weight = get_kl_weight(epoch)
     for hsi in loader:
         hsi = hsi.to(
             device,
@@ -1287,6 +1288,7 @@ def validate(
                 target=hsi,
                 mu=mu,
                 logvar=logvar,
+                KL_WEIGHT = kl_weight
             )
             mrae_value,rmse_value,sam_value,psnr_value,ssim_value = calculate_aux_losses (reconstruction = reconstruction,target = hsi,mu = mu,logvar = logvar)
 
@@ -1552,6 +1554,7 @@ def main() -> None:
             loader=validation_loader,
             device=device,
             use_amp=use_amp,
+            epoch = epoch
         )
 
         #Uncomment if needed
