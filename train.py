@@ -46,7 +46,7 @@ WEIGHT_DECAY = 1e-4
 
 #KL_WEIGHT = 1e-6
 
-KL_MAX_WEIGHT = 0.1
+KL_MAX_WEIGHT = 1e-3
 
 KL_START_EPOCH = 1
 KL_END_EPOCH = 50      # reach full weight after 30 epochs
