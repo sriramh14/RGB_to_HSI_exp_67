@@ -437,6 +437,7 @@ class RGB_to_HSI_w_diffusion(nn.Module):
         zt = noise_scheduler.add_noise(z0, noise, t_idx)
         #rgb_t = noise_scheduler.add_noise(rgb,noise_rgb,t_idx)
         # ── 3. DiT predicts noise from zₜ, conditioned on RGB ───────────────────
+        rgb_t = rgb
         pred = self.dit(zt, t_idx, rgb_t)
         
         if self.dit.learn_sigma:
