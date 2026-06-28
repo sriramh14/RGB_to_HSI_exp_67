@@ -413,11 +413,12 @@ class RGB_to_HSI_w_diffusion(nn.Module):
         
         # ── 2. Sample noise and corrupt z0 → zₜ ─────────────────────────────────
         noise = torch.randn_like(z0)
+        noise_rgb = torch.randn_like(rgb)
         #t_idx = (t * (self.T - 1)).long().clamp(0, self.T - 1)   # (B,) int64
         t_idx = t
         
         zt = noise_scheduler.add_noise(z0, noise, t_idx)
-        rgb_t = noise_scheduler.add_noise(rgb,noise,t_idx)
+        rgb_t = noise_scheduler.add_noise(rgb,noise_rgb,t_idx)
         # ── 3. DiT predicts noise from zₜ, conditioned on RGB ───────────────────
         pred = self.dit(zt, t_idx, rgb_t)
         
