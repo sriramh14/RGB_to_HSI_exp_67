@@ -392,6 +392,22 @@ class RGB_to_HSI_w_diffusion(nn.Module):
 
         self.vae.encoder.eval()
         self.vae.decoder.eval()
+
+        
+        # Registered as buffers so they move to the correct device
+        # automatically and are saved in the checkpoint.
+        self.register_buffer("latent_mean", torch.tensor(0.0))
+        self.register_buffer("latent_std",  torch.tensor(1.0))
+
+    def set_latent_stats(self, mean: float, std: float) -> None:
+        self.latent_mean.fill_(mean)
+        self.latent_std.fill_(std)
+
+    def normalize_latent(self, z: torch.Tensor) -> torch.Tensor:
+        return (z - self.latent_mean) / self.latent_std.clamp(min=1e-6)
+
+    def denormalize_latent(self, z: torch.Tensor) -> torch.Tensor:
+        return z * self.latent_std + self.latent_mean
         
     def forward(self, hsi, rgb, t, noise_scheduler):
         """
@@ -410,6 +426,7 @@ class RGB_to_HSI_w_diffusion(nn.Module):
         # ── 1. Encode HSI → clean latent z0 (frozen VAE, no grad needed) ────────
         with torch.no_grad():
             z0, _, _ = self.vae.encode(hsi, sample=False)
+            z0 = self.normalize_latent(z0)   # → roughly N(0, 1)
         
         # ── 2. Sample noise and corrupt z0 → zₜ ─────────────────────────────────
         noise = torch.randn_like(z0)
@@ -418,7 +435,7 @@ class RGB_to_HSI_w_diffusion(nn.Module):
         t_idx = t
         
         zt = noise_scheduler.add_noise(z0, noise, t_idx)
-        rgb_t = noise_scheduler.add_noise(rgb,noise_rgb,t_idx)
+        #rgb_t = noise_scheduler.add_noise(rgb,noise_rgb,t_idx)
         # ── 3. DiT predicts noise from zₜ, conditioned on RGB ───────────────────
         pred = self.dit(zt, t_idx, rgb_t)
         
@@ -436,10 +453,13 @@ class RGB_to_HSI_w_diffusion(nn.Module):
         # This mirrors what a DDPM sampler does at inference in a single step.
         alpha_bar_t = noise_scheduler.alphas_cumprod[t_idx].to(zt.device)
         alpha_bar_t = alpha_bar_t.view(-1, 1, 1, 1).clamp(min=1e-5)  # prevent /0
-
+        
         #To avoid nan error
         z0_pred   = (zt - (1 - alpha_bar_t).sqrt() * pred_noise) / alpha_bar_t.sqrt()
         z0_pred   = torch.clamp(z0_pred, -10.0, 10.0)
+
+        #Back to latent space normalisation
+        z0_pred   = self.denormalize_latent(z0_pred)
 
         #normalising hsi to 0 to 1
         with torch.no_grad():
