@@ -1109,7 +1109,7 @@ def main() -> None:
             print(f"  ✓ New best checkpoint: {best_val_loss:.6f}")
 
 @torch.no_grad()
-def compute_latent_statistics(vae, train_loader, device):
+def compute_latent_statistics(vae, loader, device):
     all_means = []
     all_vars  = []
     for hsi, _ in loader:
