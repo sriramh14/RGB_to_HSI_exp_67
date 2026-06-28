@@ -1050,7 +1050,7 @@ def main() -> None:
 
     best_val_loss = float("inf")
 
-    l_mean,l_std = compute_latent_statistics (vae,loader,device)
+    l_mean,l_std = compute_latent_statistics (pretained_vae,loader,device)
     print(l_mean)
     print(l_std)
     print("Stats")
@@ -1109,7 +1109,7 @@ def main() -> None:
             print(f"  ✓ New best checkpoint: {best_val_loss:.6f}")
 
 @torch.no_grad()
-def compute_latent_statistics(vae, loader, device):
+def compute_latent_statistics(vae, train_loader, device):
     all_means = []
     all_vars  = []
     for hsi, _ in loader:
