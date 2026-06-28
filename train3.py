@@ -52,7 +52,7 @@ DEPTH        = 12
 NUM_HEADS    = 4
 MLP_RATIO    = 4.0
 PATCH_SIZE   = 4       # DiT patch size (tokens)
-INPUT_SIZE   = 16      # spatial size of the latent (64 px image → 2 downsamples → 16)
+INPUT_SIZE   = 64      # spatial size of the latent (64 px image → 2 downsamples → 16)
 LEARN_SIGMA  = False
 
 # ── Diffusion scheduler ───────────────────────────────────────────────────────
