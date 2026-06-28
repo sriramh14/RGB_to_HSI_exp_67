@@ -64,7 +64,7 @@ PATCH_SIZE_PX      = 256    # spatial crop size fed to the model (pixels)
 PATCHES_PER_IMAGE  = 1
 
 BATCH_SIZE     = 4
-NUM_EPOCHS     = 75
+NUM_EPOCHS     = 50
 LEARNING_RATE  = 1e-4
 WEIGHT_DECAY   = 1e-4
 
