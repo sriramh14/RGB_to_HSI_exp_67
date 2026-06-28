@@ -32,7 +32,7 @@ HSI_KEY = "cube"
 VALIDATION_CACHE = Path(OUTPUT_DIR) / "hsi_validation_cache.pth"
 
 HSI_CHANNELS = 31
-PATCH_SIZE = None
+PATCH_SIZE = 512
 PATCHES_PER_IMAGE = 1
 
 BASE_CHANNELS = 64
