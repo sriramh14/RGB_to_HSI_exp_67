@@ -28,6 +28,25 @@ from loss.ssim import ssim
 DATA_DIR = "/kaggle/input/datasets/sriramhari14/ntire-2022/Train_spectral"
 OUTPUT_DIR = "./vae_checkpoints"
 
+# ============================================================
+# Resume-training configuration
+# ============================================================
+
+RESUME_TRAINING = True
+
+# Use last_vae.pth to continue from the final completed epoch.
+# Use best_vae.pth to fine-tune from the best validation checkpoint.
+RESUME_CHECKPOINT = (
+    Path(OUTPUT_DIR) / "last_vae.pth"
+)
+
+# Number of additional epochs after the checkpoint epoch.
+EXTRA_EPOCHS = 50
+
+# The old cosine scheduler has likely reduced the LR close to eta_min.
+# Therefore, explicitly begin a new low-LR refinement phase.
+RESUME_LEARNING_RATE = 2e-5
+
 HSI_KEY = "cube"
 VALIDATION_CACHE = Path(OUTPUT_DIR) / "hsi_validation_cache.pth"
 
@@ -1375,8 +1394,11 @@ def save_checkpoint(
     output_path: Path,
     model: HSIVAE,
     optimizer: torch.optim.Optimizer,
+    scheduler,
+    scaler: GradScaler,
     epoch: int,
     validation_loss: float,
+    best_validation_loss: float,
 ) -> None:
     output_path.parent.mkdir(
         parents=True,
@@ -1386,11 +1408,41 @@ def save_checkpoint(
     torch.save(
         {
             "epoch": epoch,
-            "model_state_dict": model.state_dict(),
+
+            "model_state_dict": (
+                model.state_dict()
+            ),
+
             "optimizer_state_dict": (
                 optimizer.state_dict()
             ),
-            "validation_loss": validation_loss,
+
+            "scheduler_state_dict": (
+                scheduler.state_dict()
+                if scheduler is not None
+                else None
+            ),
+
+            "scaler_state_dict": (
+                scaler.state_dict()
+            ),
+
+            "validation_loss": (
+                validation_loss
+            ),
+
+            "best_validation_loss": (
+                best_validation_loss
+            ),
+
+            "kl_weight": (
+                get_kl_weight(epoch)
+            ),
+
+            "learning_rate": (
+                optimizer.param_groups[0]["lr"]
+            ),
+
             "model_config": {
                 "hsi_channels": HSI_CHANNELS,
                 "base_channels": BASE_CHANNELS,
@@ -1500,12 +1552,12 @@ def main() -> None:
         num_res_blocks=NUM_RES_BLOCKS,
     ).to(device)
 
-    optimizer = torch.optim.AdamW(
+    '''optimizer = torch.optim.AdamW(
         model.parameters(),
         lr=LEARNING_RATE,
         weight_decay=WEIGHT_DECAY,
     )
-
+'''
     '''scheduler = (
         torch.optim.lr_scheduler.ReduceLROnPlateau(
             optimizer,
@@ -1514,6 +1566,8 @@ def main() -> None:
             patience=5,
         )
     )'''
+
+    '''
     scheduler = (
         torch.optim.lr_scheduler.CosineAnnealingLR(
             optimizer,
@@ -1533,11 +1587,168 @@ def main() -> None:
         exist_ok=True,
     )
 
+    best_validation_loss = float("inf")'''
+
+    optimizer = torch.optim.AdamW(
+        model.parameters(),
+        lr=LEARNING_RATE,
+        weight_decay=WEIGHT_DECAY,
+    )
+    
+    scaler = GradScaler(
+        enabled=use_amp
+    )
+    
+    # Defaults for training from scratch.
+    start_epoch = 1
+    end_epoch = NUM_EPOCHS
     best_validation_loss = float("inf")
+    
+    if RESUME_TRAINING:
+        resume_path = Path(
+            RESUME_CHECKPOINT
+        )
+    
+        if not resume_path.exists():
+            raise FileNotFoundError(
+                "Resume checkpoint does not exist:\n"
+                f"{resume_path}"
+            )
+    
+        print(
+            "\nResuming training from checkpoint:\n"
+            f"{resume_path}"
+        )
+    
+        try:
+            checkpoint = torch.load(
+                resume_path,
+                map_location=device,
+                weights_only=False,
+            )
+        except TypeError:
+            checkpoint = torch.load(
+                resume_path,
+                map_location=device,
+            )
+    
+        # --------------------------------------------------------
+        # Restore model parameters
+        # --------------------------------------------------------
+    
+        model.load_state_dict(
+            checkpoint["model_state_dict"],
+            strict=True,
+        )
+    
+        # --------------------------------------------------------
+        # Restore AdamW momentum and variance states
+        # --------------------------------------------------------
+    
+        if "optimizer_state_dict" in checkpoint:
+            optimizer.load_state_dict(
+                checkpoint[
+                    "optimizer_state_dict"
+                ]
+            )
+    
+        # --------------------------------------------------------
+        # Restore AMP scaler when available
+        # --------------------------------------------------------
+    
+        if (
+            "scaler_state_dict" in checkpoint
+            and checkpoint["scaler_state_dict"] is not None
+        ):
+            scaler.load_state_dict(
+                checkpoint[
+                    "scaler_state_dict"
+                ]
+            )
+    
+        completed_epoch = int(
+            checkpoint.get(
+                "epoch",
+                0,
+            )
+        )
+    
+        start_epoch = completed_epoch + 1
+    
+        end_epoch = (
+            completed_epoch
+            + EXTRA_EPOCHS
+        )
+    
+        best_validation_loss = float(
+            checkpoint.get(
+                "best_validation_loss",
+                checkpoint.get(
+                    "validation_loss",
+                    float("inf"),
+                ),
+            )
+        )
+    
+        # optimizer.load_state_dict() restores the old learning
+        # rate, which may be near 1e-7 after cosine annealing.
+        # Override it for the new refinement phase.
+        for parameter_group in optimizer.param_groups:
+            parameter_group["lr"] = (
+                RESUME_LEARNING_RATE
+            )
+    
+        # Start a new cosine schedule specifically for the
+        # additional refinement epochs.
+        scheduler = (
+            torch.optim.lr_scheduler.CosineAnnealingLR(
+                optimizer,
+                T_max=max(
+                    1,
+                    EXTRA_EPOCHS,
+                ),
+                eta_min=1e-7,
+            )
+        )
+    
+        print(
+            f"Checkpoint epoch: {completed_epoch}"
+        )
+    
+        print(
+            f"Resume from epoch: {start_epoch}"
+        )
+    
+        print(
+            f"Train through epoch: {end_epoch}"
+        )
+    
+        print(
+            "Resume learning rate: "
+            f"{RESUME_LEARNING_RATE:.2e}"
+        )
+    
+        print(
+            "KL weight during resumed phase: "
+            f"{get_kl_weight(start_epoch):.2e}"
+        )
+    
+    else:
+        scheduler = (
+            torch.optim.lr_scheduler.CosineAnnealingLR(
+                optimizer,
+                T_max=NUM_EPOCHS,
+                eta_min=1e-7,
+            )
+        )
+    
+        print(
+            "\nStarting VAE training from scratch."
+        )
 
     for epoch in range(
-        1,
-        NUM_EPOCHS + 1,
+        start_epoch,
+        end_epoch + 1,
     ):
         training_metrics = train_one_epoch(
             model=model,
@@ -1570,7 +1781,7 @@ def main() -> None:
         )
 
         print(
-            f"Epoch {epoch:03d}/{NUM_EPOCHS:03d} | "
+            f"Epoch {epoch:03d}/{end_epoch:03d} | "
             f"LR: {current_learning_rate:.2e} | "
             f"Train total: "
             f"{training_metrics['loss']:.6f} | "
@@ -1586,6 +1797,7 @@ def main() -> None:
             f"{validation_metrics['kl']:.6f}"
         )
 
+        
         save_checkpoint(
             output_path=(
                 output_dir
@@ -1593,9 +1805,14 @@ def main() -> None:
             ),
             model=model,
             optimizer=optimizer,
+            scheduler=scheduler,
+            scaler=scaler,
             epoch=epoch,
             validation_loss=(
                 validation_metrics["loss"]
+            ),
+            best_validation_loss=(
+                best_validation_loss
             ),
         )
 
@@ -1614,8 +1831,13 @@ def main() -> None:
                 ),
                 model=model,
                 optimizer=optimizer,
+                scheduler=scheduler,
+                scaler=scaler,
                 epoch=epoch,
                 validation_loss=(
+                    validation_metrics["loss"]
+                ),
+                best_validation_loss=(
                     best_validation_loss
                 ),
             )
