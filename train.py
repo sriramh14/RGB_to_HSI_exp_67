@@ -37,7 +37,7 @@ RESUME_TRAINING = True
 # Use last_vae.pth to continue from the final completed epoch.
 # Use best_vae.pth to fine-tune from the best validation checkpoint.
 RESUME_CHECKPOINT = (
-    Path(OUTPUT_DIR) / "last_vae.pth"
+    Path(OUTPUT_DIR) / "best_vae.pth"
 )
 
 # Number of additional epochs after the checkpoint epoch.
