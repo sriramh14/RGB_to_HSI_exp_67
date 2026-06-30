@@ -47,7 +47,7 @@ LATENT_CHANNELS = 16
 NUM_RES_BLOCKS  = 2
 
 # DiT hyper-parameters
-HIDDEN_SIZE  = 256
+HIDDEN_SIZE  = 128
 DEPTH        = 6
 NUM_HEADS    = 4
 MLP_RATIO    = 4.0
