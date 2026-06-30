@@ -60,7 +60,7 @@ NUM_TRAIN_TIMESTEPS = 1000
 BETA_SCHEDULE       = "squaredcos_cap_v2"   # cosine schedule; change to "linear" if preferred
 
 # ── Training ──────────────────────────────────────────────────────────────────
-PATCH_SIZE_PX      = 512    # spatial crop size fed to the model (pixels)
+PATCH_SIZE_PX      = 256    # spatial crop size fed to the model (pixels)
 PATCHES_PER_IMAGE  = 1
 
 BATCH_SIZE     = 2
