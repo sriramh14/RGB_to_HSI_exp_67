@@ -755,6 +755,78 @@ def sample_logit_normal_timesteps(
     t = torch.sigmoid(u)   # logit-normal sample: t = sigmoid(N(m, s²))
     return t
 
+def sample_discrete_biased_timesteps(
+    batch_size: int,
+    num_timesteps: int,
+    device: torch.device,
+    uniform_mix: float = 0.5,
+    power: float = 2.0,
+) -> torch.Tensor:
+    """
+    Sample integer DDPM timesteps using a categorical distribution.
+
+    Args:
+        batch_size:
+            Number of timesteps to sample.
+
+        num_timesteps:
+            Total number of diffusion timesteps.
+
+        device:
+            Target device.
+
+        uniform_mix:
+            Fraction of the distribution that remains uniform.
+            0.5 means:
+                50% uniform distribution
+                50% low-timestep-biased distribution
+
+        power:
+            Strength of the bias toward lower timesteps.
+            power=1: mild bias
+            power=2: moderate bias
+            power=4: strong bias
+
+    Returns:
+        Integer tensor of shape [batch_size].
+    """
+
+    timesteps = torch.arange(
+        num_timesteps,
+        device=device,
+        dtype=torch.float32,
+    )
+
+    # Largest value at t=0 and smallest near t=T-1.
+    biased_weights = (
+        1.0
+        - timesteps / num_timesteps
+    ).pow(power)
+
+    biased_probs = (
+        biased_weights
+        / biased_weights.sum()
+    )
+
+    uniform_probs = torch.full(
+        (num_timesteps,),
+        fill_value=1.0 / num_timesteps,
+        device=device,
+    )
+
+    probabilities = (
+        uniform_mix * uniform_probs
+        + (1.0 - uniform_mix) * biased_probs
+    )
+
+    sampled_timesteps = torch.multinomial(
+        probabilities,
+        num_samples=batch_size,
+        replacement=True,
+    )
+
+    return sampled_timesteps.long()
+
 # ============================================================
 # Timestep-range noise-loss tracking
 # ============================================================
@@ -899,13 +971,20 @@ def train_one_epoch(
         rgb = rgb.to(device, non_blocking=True)
 
         # Sample random timesteps for each item in the batch.
-        t = torch.randint(
-            0,
-            noise_scheduler.config.num_train_timesteps,
-            (hsi.size(0),),
-            device=device,
-        )
+        #t = torch.randint(
+            #0,
+            #noise_scheduler.config.num_train_timesteps,
+            #(hsi.size(0),),
+            #device=device,
+        #)
 
+        t = sample_discrete_biased_timesteps(
+            batch_size=hsi.size(0),
+            num_timesteps=noise_scheduler.config.num_train_timesteps,
+            device=device,
+            uniform_mix=0.5,
+            power=2.0,
+        )
         # After
         #t = sample_logit_normal_timesteps(
             #batch_size=hsi.size(0),
