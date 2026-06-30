@@ -801,7 +801,7 @@ def train_one_epoch(
             raise FloatingPointError(f"Non-finite training loss: {loss.item()}")
 
         scaler.scale(loss).backward()
-        #scaler.unscale_(optimizer)
+        scaler.unscale_(optimizer)
         torch.nn.utils.clip_grad_norm_(
             trainable_params, max_norm=GRADIENT_CLIP_NORM
         )
@@ -810,7 +810,7 @@ def train_one_epoch(
 
         with torch.no_grad():
             mrae_v, rmse_v, sam_v, psnr_v, ssim_v = calculate_aux_losses(
-                hsi_recon.detach(), hsi.detach()
+                hsi_recon.detach().float(), hsi.detach().float()
             )
 
         batch_size = hsi.size(0)
@@ -929,6 +929,14 @@ def save_checkpoint(
                 "patch_size":      PATCH_SIZE,
                 "input_size":      INPUT_SIZE,
                 "learn_sigma":     LEARN_SIGMA,
+                "rgb_global_end": 0.65,
+                "rgb_regional_max": 0.35,
+                "rgb_regional_end": 0.65,
+                "rgb_local_max": 0.25,
+                "rgb_local_start": 0.85,
+                "rgb_max_update_strength": 0.25,
+                "lr_scheduler_state_dict": lr_scheduler.state_dict(),
+                "scaler_state_dict": scaler.state_dict(),
             },
         },
         output_path,
