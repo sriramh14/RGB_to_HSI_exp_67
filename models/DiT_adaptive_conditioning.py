@@ -1015,30 +1015,30 @@ class DiT(nn.Module):
             .bias
         )
     
-            # Initialize (and freeze) pos_embed by sin-cos embedding:
-            pos_embed = get_2d_sincos_pos_embed(self.pos_embed.shape[-1], int(self.x_embedder.num_patches ** 0.5))
-            self.pos_embed.data.copy_(torch.from_numpy(pos_embed).float().unsqueeze(0))
+        # Initialize (and freeze) pos_embed by sin-cos embedding:
+        pos_embed = get_2d_sincos_pos_embed(self.pos_embed.shape[-1], int(self.x_embedder.num_patches ** 0.5))
+        self.pos_embed.data.copy_(torch.from_numpy(pos_embed).float().unsqueeze(0))
     
-            # Initialize patch_embed like nn.Linear (instead of nn.Conv2d):
-            w = self.x_embedder.proj.weight.data
-            nn.init.xavier_uniform_(w.view([w.shape[0], -1]))
-            nn.init.constant_(self.x_embedder.proj.bias, 0)
+        # Initialize patch_embed like nn.Linear (instead of nn.Conv2d):
+        w = self.x_embedder.proj.weight.data
+        nn.init.xavier_uniform_(w.view([w.shape[0], -1]))
+        nn.init.constant_(self.x_embedder.proj.bias, 0)
     
     
-            # Initialize timestep embedding MLP:
-            nn.init.normal_(self.t_embedder.mlp[0].weight, std=0.02)
-            nn.init.normal_(self.t_embedder.mlp[2].weight, std=0.02)
+        # Initialize timestep embedding MLP:
+        nn.init.normal_(self.t_embedder.mlp[0].weight, std=0.02)
+        nn.init.normal_(self.t_embedder.mlp[2].weight, std=0.02)
     
-            # Zero-out adaLN modulation layers in DiT blocks:
-            for block in self.blocks:
-                nn.init.constant_(block.adaLN_modulation[-1].weight, 0)
-                nn.init.constant_(block.adaLN_modulation[-1].bias, 0)
+        # Zero-out adaLN modulation layers in DiT blocks:
+        for block in self.blocks:
+            nn.init.constant_(block.adaLN_modulation[-1].weight, 0)
+            nn.init.constant_(block.adaLN_modulation[-1].bias, 0)
     
-            # Zero-out output layers:
-            nn.init.constant_(self.final_layer.adaLN_modulation[-1].weight, 0)
-            nn.init.constant_(self.final_layer.adaLN_modulation[-1].bias, 0)
-            nn.init.constant_(self.final_layer.linear.weight, 0)
-            nn.init.constant_(self.final_layer.linear.bias, 0)
+        # Zero-out output layers:
+        nn.init.constant_(self.final_layer.adaLN_modulation[-1].weight, 0)
+        nn.init.constant_(self.final_layer.adaLN_modulation[-1].bias, 0)
+        nn.init.constant_(self.final_layer.linear.weight, 0)
+        nn.init.constant_(self.final_layer.linear.bias, 0)
 
     def unpatchify(self, x):
         """
