@@ -47,8 +47,8 @@ LATENT_CHANNELS = 16
 NUM_RES_BLOCKS  = 2
 
 # DiT hyper-parameters
-HIDDEN_SIZE  = 128
-DEPTH        = 12
+HIDDEN_SIZE  = 256
+DEPTH        = 6
 NUM_HEADS    = 4
 MLP_RATIO    = 4.0
 PATCH_SIZE   = 4       # DiT patch size (tokens)
@@ -60,7 +60,7 @@ NUM_TRAIN_TIMESTEPS = 1000
 BETA_SCHEDULE       = "squaredcos_cap_v2"   # cosine schedule; change to "linear" if preferred
 
 # ── Training ──────────────────────────────────────────────────────────────────
-PATCH_SIZE_PX      = 256    # spatial crop size fed to the model (pixels)
+PATCH_SIZE_PX      = 512    # spatial crop size fed to the model (pixels)
 PATCHES_PER_IMAGE  = 1
 
 BATCH_SIZE     = 2
