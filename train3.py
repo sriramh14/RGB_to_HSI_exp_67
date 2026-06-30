@@ -935,8 +935,6 @@ def save_checkpoint(
                 "rgb_local_max": 0.25,
                 "rgb_local_start": 0.85,
                 "rgb_max_update_strength": 0.25,
-                "lr_scheduler_state_dict": lr_scheduler.state_dict(),
-                "scaler_state_dict": scaler.state_dict(),
             },
         },
         output_path,
