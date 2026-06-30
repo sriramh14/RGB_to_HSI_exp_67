@@ -13,7 +13,7 @@ from torch.utils.data import DataLoader, Dataset
 from diffusers import DDPMScheduler
 
 from models.HSI_VAE import HSIVAE
-from models.diffusion_DiT import RGB_to_HSI_w_diffusion  # adjust to your actual module path
+from models.DiT_adaptive_conditioning import RGB_to_HSI_w_diffusion  # adjust to your actual module path
 
 from loss.mrae import mrae
 from loss.psnr import psnr
@@ -47,7 +47,7 @@ LATENT_CHANNELS = 16
 NUM_RES_BLOCKS  = 2
 
 # DiT hyper-parameters
-HIDDEN_SIZE  = 256
+HIDDEN_SIZE  = 128
 DEPTH        = 12
 NUM_HEADS    = 4
 MLP_RATIO    = 4.0
@@ -63,7 +63,7 @@ BETA_SCHEDULE       = "squaredcos_cap_v2"   # cosine schedule; change to "linear
 PATCH_SIZE_PX      = 256    # spatial crop size fed to the model (pixels)
 PATCHES_PER_IMAGE  = 1
 
-BATCH_SIZE     = 4
+BATCH_SIZE     = 2
 NUM_EPOCHS     = 50
 LEARNING_RATE  = 1e-4
 WEIGHT_DECAY   = 1e-4
