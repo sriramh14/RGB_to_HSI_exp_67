@@ -1357,6 +1357,16 @@ class RGB_to_HSI_w_diffusion(nn.Module):
             hsi_recon = torch.clamp(hsi_recon, 0.0, 1.0)
         
         return loss, hsi_recon, pred_noise
-            
+
+    def train(self, mode: bool = True):
+        super().train(mode)
+    
+        # The DiT follows the requested mode, but the frozen VAE
+        # always remains in evaluation mode.
+        self.vae.encoder.eval()
+        self.vae.decoder.eval()
+    
+        return self
+                
                 
         
