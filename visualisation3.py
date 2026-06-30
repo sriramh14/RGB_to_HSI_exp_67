@@ -50,7 +50,7 @@ OUTPUT_DIR = "./vae_reconstruction_visualizations"
 
 # Python module and class containing the exact VAE architecture used in training.
 # Example: if the class is defined as models/vae.py -> class HSIVAE(...), use:
-MODEL_MODULE = "models.vae"
+MODEL_MODULE = "models/HSI_VAE.py"
 MODEL_CLASS = "HSIVAE"
 
 # These values must match training. Values from checkpoint["model_config"]
