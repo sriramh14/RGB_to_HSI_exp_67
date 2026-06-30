@@ -1014,7 +1014,17 @@ def validate(
         )
 
         with autocast(enabled=use_amp):
-            loss, hsi_recon, _ = model(hsi, rgb, t, noise_scheduler)
+            (
+                loss,
+                hsi_recon,
+                pred_noise,
+                target_noise,
+            ) = model(
+                hsi,
+                rgb,
+                t,
+                noise_scheduler,
+            )
 
         mrae_v, rmse_v, sam_v, psnr_v, ssim_v = calculate_aux_losses(
             hsi_recon, hsi
