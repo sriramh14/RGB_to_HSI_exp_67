@@ -3,8 +3,13 @@
 Before running:
     1. Replace the HSIVAE import below with the import used in your project.
     2. Set DATA_DIR and CHECKPOINT_PATH.
-    3. Make sure MODEL_KWARGS, HSI_CHANNELS, PATCH_SIZE, and NORMALIZATION
-       match the settings used during VAE training.
+    3. Make sure MODEL_KWARGS, HSI_CHANNELS, MODEL_DOWNSAMPLE_FACTOR,
+       and NORMALIZATION match the settings used during VAE training.
+
+This version performs inference on the complete spatial-resolution HSI cube.
+It does not extract or center-crop a patch. If the image dimensions are not
+compatible with the VAE downsampling factor, the script pads only the bottom
+and right borders, runs the VAE, and removes the padding afterward.
 
 Expected VAE input:
     HSI tensor with shape [B, C, H, W].
@@ -79,9 +84,16 @@ HSI_CHANNELS = 31
 # Name of the HSI variable inside MATLAB files.
 HSI_KEY = "cube"
 
-# Use None to process the complete HSI image.
-# Use an integer when the VAE was trained on fixed-size patches.
-PATCH_SIZE: Optional[int] = 64
+# Total spatial downsampling factor of the VAE encoder.
+# Examples:
+#   two stride-2 downsampling layers   -> 4
+#   three stride-2 downsampling layers -> 8
+# Set this to 1 when the VAE accepts arbitrary image dimensions directly.
+MODEL_DOWNSAMPLE_FACTOR = 4
+
+# Border mode used only when padding is required for full-resolution inference.
+# "replicate" is safe for HSI cubes and avoids inserting artificial zero values.
+PADDING_MODE = "replicate"
 
 NUM_IMAGES = 5
 
@@ -363,36 +375,84 @@ def normalize_cube(
     )
 
 
-def center_crop_or_pad(
+def pad_full_resolution_image(
     cube: torch.Tensor,
-    patch_size: Optional[int],
-) -> torch.Tensor:
-    """Center-crop or replicate-pad a [C, H, W] tensor."""
+    spatial_multiple: int,
+    padding_mode: str,
+) -> tuple[torch.Tensor, tuple[int, int]]:
+    """Pad a full [C, H, W] cube to a model-compatible spatial size.
 
-    if patch_size is None:
-        return cube
+    Padding is added only to the right and bottom borders. The returned
+    ``(height, width)`` tuple records the original image size so the VAE
+    output can be restored exactly after inference.
+    """
 
-    _, height, width = cube.shape
-
-    pad_height = max(0, patch_size - height)
-    pad_width = max(0, patch_size - width)
-
-    if pad_height > 0 or pad_width > 0:
-        cube = F.pad(
-            cube,
-            (0, pad_width, 0, pad_height),
-            mode="replicate",
+    if cube.ndim != 3:
+        raise ValueError(
+            "Expected the full HSI cube to have shape [C, H, W], "
+            f"but found {tuple(cube.shape)}"
         )
 
-    _, height, width = cube.shape
+    if spatial_multiple < 1:
+        raise ValueError(
+            "MODEL_DOWNSAMPLE_FACTOR must be at least 1, "
+            f"but found {spatial_multiple}."
+        )
 
-    top = (height - patch_size) // 2
-    left = (width - patch_size) // 2
+    _, original_height, original_width = cube.shape
 
-    return cube[
-        :,
-        top : top + patch_size,
-        left : left + patch_size,
+    if spatial_multiple == 1:
+        return cube, (original_height, original_width)
+
+    pad_height = (
+        spatial_multiple - original_height % spatial_multiple
+    ) % spatial_multiple
+
+    pad_width = (
+        spatial_multiple - original_width % spatial_multiple
+    ) % spatial_multiple
+
+    if pad_height == 0 and pad_width == 0:
+        return cube, (original_height, original_width)
+
+    padded_cube = F.pad(
+        cube,
+        (0, pad_width, 0, pad_height),
+        mode=padding_mode,
+    )
+
+    return padded_cube, (original_height, original_width)
+
+
+def remove_inference_padding(
+    reconstruction: torch.Tensor,
+    original_size: tuple[int, int],
+) -> torch.Tensor:
+    """Crop a padded [B, C, H, W] reconstruction to its original size."""
+
+    if reconstruction.ndim != 4:
+        raise ValueError(
+            "Expected reconstruction shape [B, C, H, W], "
+            f"but found {tuple(reconstruction.shape)}"
+        )
+
+    original_height, original_width = original_size
+
+    if (
+        reconstruction.shape[-2] < original_height
+        or reconstruction.shape[-1] < original_width
+    ):
+        raise ValueError(
+            "The reconstructed image is smaller than the original image: "
+            f"reconstruction={tuple(reconstruction.shape)}, "
+            f"original spatial size=({original_height}, {original_width}). "
+            "Check MODEL_DOWNSAMPLE_FACTOR and the VAE architecture."
+        )
+
+    return reconstruction[
+        ...,
+        :original_height,
+        :original_width,
     ]
 
 
@@ -1059,12 +1119,19 @@ def main() -> None:
                 np.ascontiguousarray(cube)
             ).float()
 
-            hsi = center_crop_or_pad(
-                cube=hsi,
-                patch_size=PATCH_SIZE,
+            # Keep the unpadded full-resolution target for metrics and plots.
+            target = hsi.to(
+                device,
+                non_blocking=True,
             )
 
-            hsi_batch = hsi.unsqueeze(0).to(
+            padded_hsi, original_size = pad_full_resolution_image(
+                cube=hsi,
+                spatial_multiple=MODEL_DOWNSAMPLE_FACTOR,
+                padding_mode=PADDING_MODE,
+            )
+
+            hsi_batch = padded_hsi.unsqueeze(0).to(
                 device,
                 non_blocking=True,
             )
@@ -1080,20 +1147,38 @@ def main() -> None:
                     f"but found {tuple(reconstruction.shape)}"
                 )
 
-            if reconstruction.shape != hsi_batch.shape:
+            if reconstruction.shape[0] != hsi_batch.shape[0]:
                 raise ValueError(
-                    "Input and reconstruction shapes differ: "
+                    "Input and reconstruction batch sizes differ: "
                     f"input={tuple(hsi_batch.shape)}, "
                     f"reconstruction={tuple(reconstruction.shape)}"
                 )
 
-            target = hsi_batch[0]
-            reconstruction = reconstruction[0]
+            if reconstruction.shape[1] != hsi_batch.shape[1]:
+                raise ValueError(
+                    "Input and reconstruction channel counts differ: "
+                    f"input={tuple(hsi_batch.shape)}, "
+                    f"reconstruction={tuple(reconstruction.shape)}"
+                )
+
+            reconstruction = remove_inference_padding(
+                reconstruction=reconstruction,
+                original_size=original_size,
+            )[0]
+
+            if reconstruction.shape != target.shape:
+                raise ValueError(
+                    "The restored full-resolution output does not match "
+                    "the original HSI shape: "
+                    f"target={tuple(target.shape)}, "
+                    f"reconstruction={tuple(reconstruction.shape)}"
+                )
 
             print(f"\nFile: {file_path.name}")
-            print(f"Input shape: {tuple(target.shape)}")
+            print(f"Full-resolution input: {tuple(target.shape)}")
+            print(f"Model input after padding: {tuple(hsi_batch.shape)}")
             print(
-                "Reconstruction shape: "
+                "Full-resolution reconstruction: "
                 f"{tuple(reconstruction.shape)}"
             )
 
