@@ -755,6 +755,127 @@ def sample_logit_normal_timesteps(
     t = torch.sigmoid(u)   # logit-normal sample: t = sigmoid(N(m, s²))
     return t
 
+# ============================================================
+# Timestep-range noise-loss tracking
+# ============================================================
+
+TIMESTEP_BINS = [
+    (0, 100),
+    (100, 250),
+    (250, 500),
+    (500, 750),
+    (750, 1000),
+]
+
+
+def create_timestep_bin_tracker():
+    """
+    Stores accumulated per-sample noise loss and sample count
+    for each timestep interval.
+    """
+    return {
+        (lower, upper): {
+            "loss_sum": 0.0,
+            "count": 0,
+        }
+        for lower, upper in TIMESTEP_BINS
+    }
+
+
+@torch.no_grad()
+def update_timestep_bin_tracker(
+    tracker,
+    timesteps: torch.Tensor,
+    pred_noise: torch.Tensor,
+    target_noise: torch.Tensor,
+) -> None:
+    """
+    Calculate noise-prediction MSE separately for every sample,
+    then add each sample to its corresponding timestep interval.
+
+    Args:
+        tracker:
+            Dictionary created by create_timestep_bin_tracker().
+
+        timesteps:
+            Tensor [B] containing integer diffusion timesteps.
+
+        pred_noise:
+            Tensor [B, C, H, W].
+
+        target_noise:
+            Tensor [B, C, H, W].
+    """
+
+    # Compute one scalar MSE for every sample:
+    # [B, C, H, W] -> [B]
+    per_sample_loss = F.mse_loss(
+        pred_noise.detach().float(),
+        target_noise.detach().float(),
+        reduction="none",
+    ).mean(dim=(1, 2, 3))
+
+    for lower, upper in TIMESTEP_BINS:
+        mask = (
+            (timesteps >= lower)
+            & (timesteps < upper)
+        )
+
+        if not mask.any():
+            continue
+
+        tracker[(lower, upper)]["loss_sum"] += (
+            per_sample_loss[mask].sum().item()
+        )
+
+        tracker[(lower, upper)]["count"] += int(
+            mask.sum().item()
+        )
+
+
+def finalize_timestep_bin_tracker(tracker) -> dict:
+    """
+    Convert accumulated sums into mean losses.
+    """
+    results = {}
+
+    for (lower, upper), values in tracker.items():
+        count = values["count"]
+
+        results[f"{lower}-{upper - 1}"] = {
+            "noise_loss": (
+                values["loss_sum"] / count
+                if count > 0
+                else float("nan")
+            ),
+            "count": count,
+        }
+
+    return results
+
+
+def print_timestep_bin_losses(
+    title: str,
+    bin_results: dict,
+) -> None:
+    print(f"\n{title}")
+
+    for range_name, values in bin_results.items():
+        loss = values["noise_loss"]
+        count = values["count"]
+
+        if count == 0:
+            print(
+                f"  t={range_name:>8s} | "
+                f"Noise loss: no samples"
+            )
+        else:
+            print(
+                f"  t={range_name:>8s} | "
+                f"Noise loss: {loss:.6f} | "
+                f"Samples: {count}"
+            )
+            
 
 def train_one_epoch(
     model: RGB_to_HSI_w_diffusion,
@@ -771,6 +892,7 @@ def train_one_epoch(
     total_mrae = total_rmse = total_sam = total_psnr = total_ssim = 0.0
     total_samples = 0
     trainable_params = list(model.dit.parameters())
+    timestep_tracker = create_timestep_bin_tracker()
     
     for batch_index, (hsi, rgb) in enumerate(loader, start=1):
         hsi = hsi.to(device, non_blocking=True)
@@ -795,10 +917,27 @@ def train_one_epoch(
         optimizer.zero_grad(set_to_none=True)
 
         with autocast(enabled=use_amp):
-            loss, hsi_recon, _ = model(hsi, rgb, t, noise_scheduler)
+            (
+                loss,
+                hsi_recon,
+                pred_noise,
+                target_noise,
+            ) = model(
+                hsi,
+                rgb,
+                t,
+                noise_scheduler,
+            )
 
         if not torch.isfinite(loss):
             raise FloatingPointError(f"Non-finite training loss: {loss.item()}")
+
+        update_timestep_bin_tracker(
+            tracker=timestep_tracker,
+            timesteps=t,
+            pred_noise=pred_noise,
+            target_noise=target_noise,
+        )
 
         scaler.scale(loss).backward()
         scaler.unscale_(optimizer)
@@ -834,6 +973,9 @@ def train_one_epoch(
                 f"SSIM: {total_ssim / n:.4f}"
             )
 
+    timestep_losses = finalize_timestep_bin_tracker(
+        timestep_tracker
+    )
     n = total_samples
     return {
         "noise_loss": total_noise_loss / n,
@@ -842,6 +984,7 @@ def train_one_epoch(
         "sam":   total_sam   / n,
         "psnr":  total_psnr  / n,
         "ssim":  total_ssim  / n,
+        "timestep_losses": timestep_losses,
     }
 
 
@@ -1088,6 +1231,12 @@ def main() -> None:
             f"Val SAM:  {val_metrics['sam']:.6f} | "
             f"Val PSNR: {val_metrics['psnr']:.4f} | "
             f"Val SSIM: {val_metrics['ssim']:.4f}"
+        )
+        print_timestep_bin_losses(
+            title="Training noise loss by timestep range",
+            bin_results=train_metrics[
+                "timestep_losses"
+            ],
         )
 
         # Always save latest.
