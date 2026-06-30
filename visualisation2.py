@@ -1,706 +1,523 @@
-"""Visualization script for the full RGB-to-HSI diffusion model.
+"""
+Full-resolution RGB-to-HSI visualization using overlap-tiled latent diffusion.
 
-Runs the complete DDPM reverse denoising loop conditioned on an RGB image,
-decodes the final latent with the frozen VAE decoder, and plots the result
-alongside the ground-truth HSI and an error map.
+This script:
+1. Loads one full-resolution RGB image without resizing or center cropping.
+2. Pads only on the right/bottom when required.
+3. Runs the trained fixed-size RGB-conditioned latent diffusion model on
+   overlapping tiles.
+4. Blends predicted latent tiles.
+5. Decodes the complete blended latent canvas once.
+6. Saves:
+      - predicted_hsi.npy       [C, H, W]
+      - predicted_hsi.mat       variable: cube, shape [H, W, C]
+      - visualization.png
 """
 
-from __future__ import annotations
-
-import random
+import math
 from pathlib import Path
-from typing import Optional
+from typing import Dict, Tuple
 
-import h5py
 import matplotlib.pyplot as plt
 import numpy as np
 import scipy.io as sio
 import torch
 import torch.nn.functional as F
 from diffusers import DDPMScheduler
+from PIL import Image
 
-from models.diffusion_DiT import RGB_to_HSI_w_diffusion
-
-
-# ============================================================
-# Configuration
-# ============================================================
-
-HSI_DATA_DIR = (
-    "/kaggle/input/datasets/sriramhari14/"
-    "ntire-2022/Train_spectral/Train_spectral"
-)
-
-RGB_DATA_DIR = (
-    "/kaggle/input/datasets/sriramhari14/"
-    "ntire-2022/Train_RGB/Train_RGB"
-)
-
-CHECKPOINT_PATH = (
-    "./diffusion_checkpoints/best_diffusion.pth"
-)
-
-OUTPUT_DIR = "./diffusion_visualizations"
-
-# ── Model architecture (must match checkpoint) ────────────────────────────────
-HSI_CHANNELS    = 31
-BASE_CHANNELS   = 64
-LATENT_CHANNELS = 16
-NUM_RES_BLOCKS  = 2
-HIDDEN_SIZE     = 128
-DEPTH           = 10
-NUM_HEADS       = 16
-MLP_RATIO       = 4.0
-PATCH_SIZE      = 4
-INPUT_SIZE      = 16
-LEARN_SIGMA     = True
-
-# ── Diffusion scheduler ───────────────────────────────────────────────────────
-NUM_TRAIN_TIMESTEPS = 1000
-BETA_SCHEDULE       = "squaredcos_cap_v2"
-
-# Number of denoising steps at inference.
-# Fewer steps = faster but lower quality. 200 is a good balance.
-NUM_INFERENCE_STEPS = 200
-
-# ── Data ──────────────────────────────────────────────────────────────────────
-HSI_KEY           = "cube"
-PATCH_SIZE_PX     = 64
-NUM_IMAGES        = 5
-NORMALIZATION     = "none"
-
-SUPPORTED_HSI_EXTENSIONS = {".mat", ".npy", ".npz", ".pt", ".pth"}
-SUPPORTED_RGB_EXTENSIONS = {".png", ".jpg", ".jpeg", ".npy", ".pt", ".pth"}
-
-# ── Visualization ─────────────────────────────────────────────────────────────
-# Approximate red, green, blue band indices (0-based) for 31-band 400–700 nm data.
-RGB_BANDS            = (25, 15, 6)
-RGB_LOW_PERCENTILE   = 1.0
-RGB_HIGH_PERCENTILE  = 99.0
-
-SPECTRAL_LOCATIONS = (
-    (0.25, 0.25),
-    (0.50, 0.50),
-    (0.75, 0.75),
-)
-
-SEED         = 42
-SAVE_FIGURES = True
-SHOW_FIGURES = True
+from models.DiT_adaptive_conditioning import RGB_to_HSI_w_diffusion
 
 
-# ============================================================
-# Reproducibility
-# ============================================================
-
-def set_seed(seed: int) -> None:
-    random.seed(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(seed)
+def load_rgb_image(path: str) -> Tuple[torch.Tensor, np.ndarray]:
+    image = Image.open(path).convert("RGB")
+    rgb_hwc = np.asarray(image, dtype=np.float32) / 255.0
+    rgb_chw = np.transpose(rgb_hwc, (2, 0, 1))
+    tensor = torch.from_numpy(rgb_chw.copy()).float().unsqueeze(0)
+    return tensor, rgb_hwc
 
 
-# ============================================================
-# File discovery and pairing
-# ============================================================
+def extract_vae_state_dict(checkpoint: Dict) -> Dict:
+    for key in ("vae_state_dict", "model_state_dict", "state_dict"):
+        if key in checkpoint:
+            return checkpoint[key]
 
-def find_hsi_files(data_dir: str) -> list[Path]:
-    data_path = Path(data_dir)
-    if not data_path.exists():
-        raise FileNotFoundError(f"HSI directory does not exist: {data_path}")
-    files = sorted(
-        p for p in data_path.rglob("*")
-        if p.is_file() and p.suffix.lower() in SUPPORTED_HSI_EXTENSIONS
-    )
-    if not files:
-        raise RuntimeError(f"No HSI files found under {data_path}")
-    return files
+    if checkpoint and all(isinstance(v, torch.Tensor) for v in checkpoint.values()):
+        return checkpoint
 
-
-def pair_hsi_rgb_files(
-    hsi_dir: str,
-    rgb_dir: str,
-) -> list[tuple[Path, Path]]:
-    """Match HSI and RGB files by filename stem."""
-    hsi_files = find_hsi_files(hsi_dir)
-
-    rgb_path = Path(rgb_dir)
-    if not rgb_path.exists():
-        raise FileNotFoundError(f"RGB directory does not exist: {rgb_path}")
-
-    rgb_by_stem = {
-        p.stem: p
-        for p in rgb_path.rglob("*")
-        if p.is_file() and p.suffix.lower() in SUPPORTED_RGB_EXTENSIONS
-    }
-
-    pairs, missing = [], []
-    for hsi_file in hsi_files:
-        rgb_file = rgb_by_stem.get(hsi_file.stem)
-        if rgb_file is not None:
-            pairs.append((hsi_file, rgb_file))
-        else:
-            missing.append(hsi_file)
-
-    if missing:
-        print(f"Warning: {len(missing)} HSI files have no matching RGB file.")
-
-    if not pairs:
-        raise RuntimeError(
-            "No HSI/RGB pairs found. "
-            "Check that both directories use matching filename stems."
-        )
-
-    print(f"Found {len(pairs)} paired HSI/RGB files.")
-    return pairs
-
-
-# ============================================================
-# HSI loading
-# ============================================================
-
-def extract_array_from_dictionary(
-    data: dict,
-    file_path: Path,
-    preferred_key: Optional[str] = None,
-) -> np.ndarray:
-    if preferred_key and preferred_key in data:
-        value = data[preferred_key]
-        if isinstance(value, torch.Tensor):
-            value = value.detach().cpu().numpy()
-        value = np.asarray(value)
-        if value.ndim == 3:
-            return value
-
-    candidates = [
-        v for k, v in data.items()
-        if not k.startswith("__")
-        and isinstance(v, np.ndarray)
-        and v.ndim == 3
-        and np.issubdtype(v.dtype, np.number)
-    ]
-    if not candidates:
-        raise ValueError(f"No numerical 3D HSI cube found in {file_path}")
-    return max(candidates, key=lambda a: a.size)
-
-
-def load_mat_v73(file_path: Path, preferred_key: Optional[str] = None) -> np.ndarray:
-    candidates = []
-    with h5py.File(str(file_path), "r") as h5_file:
-        if preferred_key and preferred_key in h5_file and isinstance(
-            h5_file[preferred_key], h5py.Dataset
-        ):
-            cube = np.asarray(h5_file[preferred_key])
-        else:
-            def visitor(name, obj):
-                if isinstance(obj, h5py.Dataset) and obj.ndim == 3:
-                    try:
-                        array = np.asarray(obj)
-                        if np.issubdtype(array.dtype, np.number):
-                            candidates.append((name, array))
-                    except Exception:
-                        pass
-            h5_file.visititems(visitor)
-            if not candidates:
-                raise ValueError(f"No numerical 3D dataset found in {file_path}")
-            _, cube = max(candidates, key=lambda item: item[1].size)
-
-    return np.transpose(cube, axes=tuple(range(cube.ndim - 1, -1, -1)))
-
-
-def load_hsi_file(file_path: Path) -> np.ndarray:
-    ext = file_path.suffix.lower()
-    if ext == ".mat":
-        try:
-            loaded = sio.loadmat(file_path)
-            cube = extract_array_from_dictionary(loaded, file_path, HSI_KEY)
-        except (NotImplementedError, ValueError, OSError):
-            cube = load_mat_v73(file_path, HSI_KEY)
-    elif ext == ".npy":
-        cube = np.load(file_path)
-    elif ext == ".npz":
-        loaded = np.load(file_path)
-        candidates = [loaded[k] for k in loaded.files if loaded[k].ndim == 3]
-        if not candidates:
-            raise ValueError(f"No 3D array found in {file_path}")
-        cube = max(candidates, key=lambda a: a.size)
-    elif ext in {".pt", ".pth"}:
-        loaded = torch.load(file_path, map_location="cpu")
-        if isinstance(loaded, torch.Tensor):
-            cube = loaded.detach().cpu().numpy()
-        elif isinstance(loaded, np.ndarray):
-            cube = loaded
-        elif isinstance(loaded, dict):
-            cube = extract_array_from_dictionary(loaded, file_path, HSI_KEY)
-        else:
-            raise TypeError(f"Unsupported object in {file_path}: {type(loaded)}")
-    else:
-        raise ValueError(f"Unsupported HSI extension: {ext}")
-
-    cube = np.asarray(cube, dtype=np.float32)
-    cube = np.squeeze(cube)
-    if cube.ndim != 3:
-        raise ValueError(f"Expected 3D cube in {file_path}, got shape {cube.shape}")
-    return cube
-
-
-def convert_to_chw(cube: np.ndarray, hsi_channels: int, file_path: Path) -> np.ndarray:
-    if cube.shape[0] == hsi_channels:
-        return cube
-    if cube.shape[-1] == hsi_channels:
-        return np.transpose(cube, (2, 0, 1))
-    if cube.shape[1] == hsi_channels:
-        return np.transpose(cube, (1, 0, 2))
-    raise ValueError(
-        f"Cannot locate the spectral dimension in {file_path}. "
-        f"Shape: {cube.shape}; expected {hsi_channels} bands."
+    raise KeyError(
+        "Could not find a VAE state dictionary. Expected 'vae_state_dict', "
+        "'model_state_dict', or 'state_dict'."
     )
 
-
-def load_rgb_file(file_path: Path) -> np.ndarray:
-    """Load RGB as float32 [3, H, W] in [0, 1]."""
-    ext = file_path.suffix.lower()
-    if ext in {".png", ".jpg", ".jpeg"}:
-        from PIL import Image
-        img = Image.open(file_path).convert("RGB")
-        array = np.asarray(img, dtype=np.float32) / 255.0
-        return np.transpose(array, (2, 0, 1))
-    if ext == ".npy":
-        array = np.load(file_path).astype(np.float32)
-        if array.ndim == 2:
-            array = np.stack([array] * 3, axis=0)
-        elif array.shape[-1] == 3:
-            array = np.transpose(array, (2, 0, 1))
-        return array
-    if ext in {".pt", ".pth"}:
-        loaded = torch.load(file_path, map_location="cpu")
-        if isinstance(loaded, torch.Tensor):
-            array = loaded.float().numpy()
-        else:
-            raise TypeError(f"Unsupported object in RGB file {file_path}")
-        if array.ndim == 2:
-            array = np.stack([array] * 3, axis=0)
-        elif array.shape[-1] == 3:
-            array = np.transpose(array, (2, 0, 1))
-        return array
-    raise ValueError(f"Unsupported RGB extension: {ext}")
-
-
-# ============================================================
-# Normalization and cropping
-# ============================================================
-
-def normalize_cube(cube: np.ndarray, mode: str) -> np.ndarray:
-    if mode == "none":
-        return cube
-    if mode == "minmax":
-        lo, hi = cube.min(), cube.max()
-        return (cube - lo) / (hi - lo + 1e-8)
-    if mode == "band_minmax":
-        lo = cube.min(axis=(1, 2), keepdims=True)
-        hi = cube.max(axis=(1, 2), keepdims=True)
-        return (cube - lo) / (hi - lo + 1e-8)
-    raise ValueError(f"Unknown normalization mode: {mode}")
-
-
-def center_crop_pair(
-    hsi: torch.Tensor,
-    rgb: torch.Tensor,
-    patch_size: int,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Center-crop both modalities to [C, patch_size, patch_size]."""
-    def _crop(t: torch.Tensor) -> torch.Tensor:
-        _, h, w = t.shape
-        ph = max(0, patch_size - h)
-        pw = max(0, patch_size - w)
-        if ph > 0 or pw > 0:
-            t = F.pad(t, (0, pw, 0, ph), mode="replicate")
-        _, h, w = t.shape
-        top  = (h - patch_size) // 2
-        left = (w - patch_size) // 2
-        return t[:, top:top + patch_size, left:left + patch_size]
-
-    return _crop(hsi), _crop(rgb)
-
-
-# ============================================================
-# Model loading
-# ============================================================
 
 def load_model(
     checkpoint_path: str,
+    vae_checkpoint_path: str | None,
     device: torch.device,
-) -> RGB_to_HSI_w_diffusion:
-    ckpt_path = Path(checkpoint_path)
-    if not ckpt_path.exists():
-        raise FileNotFoundError(f"Checkpoint does not exist: {ckpt_path}")
+) -> Tuple[RGB_to_HSI_w_diffusion, Dict]:
+    checkpoint = torch.load(checkpoint_path, map_location="cpu")
+    config = checkpoint.get("model_config", {})
 
-    try:
-        ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
-    except TypeError:
-        ckpt = torch.load(ckpt_path, map_location=device)
-
-    if not isinstance(ckpt, dict):
-        raise TypeError("Expected the checkpoint to be a dictionary.")
-
-    cfg = ckpt.get("model_config", {})
+    num_train_timesteps = int(config.get("num_train_timesteps", config.get("T", 1000)))
 
     model = RGB_to_HSI_w_diffusion(
-        hsi_channels    = cfg.get("hsi_channels",    HSI_CHANNELS),
-        base_channels   = cfg.get("base_channels",   BASE_CHANNELS),
-        latent_channels = cfg.get("latent_channels", LATENT_CHANNELS),
-        num_res_blocks  = cfg.get("num_res_blocks",  NUM_RES_BLOCKS),
-        hidden_size     = cfg.get("hidden_size",     HIDDEN_SIZE),
-        depth           = cfg.get("depth",           DEPTH),
-        num_heads       = cfg.get("num_heads",       NUM_HEADS),
-        mlp_ratio       = cfg.get("mlp_ratio",       MLP_RATIO),
-        patch_size      = cfg.get("patch_size",      PATCH_SIZE),
-        input_size      = cfg.get("input_size",      INPUT_SIZE),
-        learn_sigma     = cfg.get("learn_sigma",     LEARN_SIGMA),
-    ).to(device)
+        hsi_channels=int(config.get("hsi_channels", 31)),
+        base_channels=int(config.get("base_channels", 64)),
+        latent_channels=int(config.get("latent_channels", 16)),
+        num_res_blocks=int(config.get("num_res_blocks", 2)),
+        hidden_size=int(config.get("hidden_size", 128)),
+        depth=int(config.get("depth", 12)),
+        num_heads=int(config.get("num_heads", 4)),
+        mlp_ratio=float(config.get("mlp_ratio", 4.0)),
+        learn_sigma=bool(config.get("learn_sigma", False)),
+        patch_size=int(config.get("patch_size", 4)),
+        input_size=int(config.get("input_size", 64)),
+        T=num_train_timesteps,
+    )
 
-    if "dit_state_dict" not in ckpt or "vae_state_dict" not in ckpt:
-        raise KeyError(
-            "Checkpoint must contain both 'dit_state_dict' and 'vae_state_dict'. "
-            "Re-save using the updated save_checkpoint() function."
+    if "dit_state_dict" not in checkpoint:
+        raise KeyError("The diffusion checkpoint does not contain 'dit_state_dict'.")
+
+    model.dit.load_state_dict(checkpoint["dit_state_dict"], strict=True)
+
+    if "vae_state_dict" in checkpoint:
+        model.vae.load_state_dict(checkpoint["vae_state_dict"], strict=True)
+    else:
+        if vae_checkpoint_path is None:
+            raise ValueError(
+                "The diffusion checkpoint does not contain VAE weights. "
+                "Pass --vae-checkpoint."
+            )
+        vae_checkpoint = torch.load(vae_checkpoint_path, map_location="cpu")
+        model.vae.load_state_dict(extract_vae_state_dict(vae_checkpoint), strict=True)
+
+    # Some DiT implementations do not store input_size as an attribute.
+    # The full-resolution tiler needs the trained latent tile size.
+    if not hasattr(model.dit, "input_size"):
+        model.dit.input_size = int(config.get("input_size", 64))
+
+    model.vae.requires_grad_(False)
+    model.eval()
+    model.to(device)
+    return model, config
+
+
+def padded_length(length: int, tile_size: int, stride: int) -> int:
+    if length <= tile_size:
+        return tile_size
+    number_of_strides = math.ceil((length - tile_size) / stride)
+    return tile_size + number_of_strides * stride
+
+
+def pad_full_rgb(
+    rgb: torch.Tensor,
+    tile_size: int,
+    overlap: int,
+) -> Tuple[torch.Tensor, Tuple[int, int]]:
+    if rgb.ndim != 4 or rgb.shape[0] != 1 or rgb.shape[1] != 3:
+        raise ValueError(f"Expected RGB [1,3,H,W], got {tuple(rgb.shape)}.")
+
+    stride = tile_size - overlap
+    if stride <= 0:
+        raise ValueError("overlap must be smaller than tile_size.")
+
+    original_height, original_width = rgb.shape[-2:]
+    padded_height = padded_length(original_height, tile_size, stride)
+    padded_width = padded_length(original_width, tile_size, stride)
+
+    rgb = F.pad(
+        rgb,
+        (0, padded_width - original_width, 0, padded_height - original_height),
+        mode="replicate",
+    )
+    return rgb, (original_height, original_width)
+
+
+def create_blending_window(
+    height: int,
+    width: int,
+    device: torch.device,
+    dtype: torch.dtype,
+) -> torch.Tensor:
+    window_y = torch.hann_window(
+        height, periodic=False, device=device, dtype=dtype
+    ).clamp_min(1e-3)
+    window_x = torch.hann_window(
+        width, periodic=False, device=device, dtype=dtype
+    ).clamp_min(1e-3)
+    return (window_y[:, None] * window_x[None, :]).unsqueeze(0).unsqueeze(0)
+
+
+@torch.no_grad()
+def sample_latent_tile(
+    model: RGB_to_HSI_w_diffusion,
+    rgb_tile: torch.Tensor,
+    scheduler: DDPMScheduler,
+    latent_channels: int,
+    latent_size: int,
+    num_inference_steps: int,
+    generator: torch.Generator,
+    use_amp: bool,
+) -> torch.Tensor:
+    device = rgb_tile.device
+
+    latent = torch.randn(
+        (1, latent_channels, latent_size, latent_size),
+        generator=generator,
+        device=device,
+        dtype=torch.float32,
+    )
+
+    scheduler.set_timesteps(num_inference_steps, device=device)
+
+    for timestep in scheduler.timesteps:
+        t_batch = torch.full(
+            (1,), int(timestep.item()), device=device, dtype=torch.long
         )
 
-    model.dit.load_state_dict(ckpt["dit_state_dict"])
-    model.vae.load_state_dict(ckpt["vae_state_dict"])
-    model.eval()
+        with torch.autocast(
+            device_type=device.type,
+            dtype=torch.float16,
+            enabled=use_amp and device.type == "cuda",
+        ):
+            predicted_noise = model.dit(latent, t_batch, rgb_tile)
 
-    for p in model.parameters():
-        p.requires_grad_(False)
+        if model.dit.learn_sigma:
+            predicted_noise = predicted_noise[:, : model.dit.in_channels]
 
-    print(f"Loaded diffusion checkpoint: {ckpt_path}")
-    epoch = ckpt.get("epoch", "unknown")
-    val_loss = ckpt.get("validation_loss", float("nan"))
-    print(f"  Epoch: {epoch} | Val noise loss: {val_loss:.6f}")
+        latent = scheduler.step(
+            model_output=predicted_noise.float(),
+            timestep=timestep,
+            sample=latent,
+            generator=generator,
+        ).prev_sample
 
-    return model
+    return latent
 
 
-# ============================================================
-# Inference — full DDPM reverse loop
-# ============================================================
-
-@torch.inference_mode()
-def denoise(
+@torch.no_grad()
+def predict_full_resolution(
     model: RGB_to_HSI_w_diffusion,
     rgb: torch.Tensor,
-    noise_scheduler: DDPMScheduler,
-    device: torch.device,
+    scheduler: DDPMScheduler,
+    tile_size: int,
+    overlap: int,
     num_inference_steps: int,
+    seed: int,
+    use_amp: bool,
 ) -> torch.Tensor:
-    """
-    Run the full DDPM reverse denoising loop conditioned on rgb.
+    device = rgb.device
 
-    Args:
-        rgb: (1, 3, H, W) RGB condition image.
+    if overlap < 0 or overlap >= tile_size:
+        raise ValueError("overlap must satisfy 0 <= overlap < tile_size.")
 
-    Returns:
-        hsi_recon: (1, HSI_CHANNELS, H, W) reconstructed HSI patch.
-    """
-    noise_scheduler.set_timesteps(num_inference_steps)
+    input_size = int(model.dit.input_size)
+    latent_channels = int(model.dit.in_channels)
 
-    # Determine latent spatial size from the VAE encoder's downsampling.
-    # Two stride-2 downsamples: 64px → 16px.
-    latent_h = rgb.shape[2] // 4
-    latent_w = rgb.shape[3] // 4
+    if tile_size % input_size != 0:
+        raise ValueError(
+            f"tile_size={tile_size} must be divisible by latent input_size={input_size}."
+        )
 
-    # Start from pure Gaussian noise in latent space.
-    zt = torch.randn(
-        1, model.dit.in_channels, latent_h, latent_w,
+    vae_scale_factor = tile_size // input_size
+    if overlap % vae_scale_factor != 0:
+        raise ValueError(
+            f"overlap={overlap} must be divisible by VAE scale factor={vae_scale_factor}."
+        )
+
+    stride = tile_size - overlap
+    padded_rgb, original_shape = pad_full_rgb(rgb, tile_size, overlap)
+    padded_height, padded_width = padded_rgb.shape[-2:]
+
+    latent_height = padded_height // vae_scale_factor
+    latent_width = padded_width // vae_scale_factor
+
+    latent_sum = torch.zeros(
+        (1, latent_channels, latent_height, latent_width),
+        device=device,
+        dtype=torch.float32,
+    )
+    weight_sum = torch.zeros(
+        (1, 1, latent_height, latent_width),
+        device=device,
+        dtype=torch.float32,
+    )
+
+    latent_window = create_blending_window(
+        input_size, input_size, device, torch.float32
+    )
+
+    y_positions = list(range(0, padded_height - tile_size + 1, stride))
+    x_positions = list(range(0, padded_width - tile_size + 1, stride))
+    total_tiles = len(y_positions) * len(x_positions)
+
+    generator = torch.Generator(device=device)
+    generator.manual_seed(seed)
+
+    print(f"Original RGB: {original_shape[0]} x {original_shape[1]}")
+    print(f"Padded RGB:   {padded_height} x {padded_width}")
+    print(f"Tile size:    {tile_size}, overlap: {overlap}")
+    print(f"Total tiles:  {total_tiles}")
+
+    tile_index = 0
+    for y in y_positions:
+        for x in x_positions:
+            tile_index += 1
+            rgb_tile = padded_rgb[:, :, y : y + tile_size, x : x + tile_size]
+
+            latent_tile = sample_latent_tile(
+                model=model,
+                rgb_tile=rgb_tile,
+                scheduler=scheduler,
+                latent_channels=latent_channels,
+                latent_size=input_size,
+                num_inference_steps=num_inference_steps,
+                generator=generator,
+                use_amp=use_amp,
+            )
+
+            latent_y = y // vae_scale_factor
+            latent_x = x // vae_scale_factor
+
+            latent_sum[
+                :, :, latent_y : latent_y + input_size, latent_x : latent_x + input_size
+            ] += latent_tile * latent_window
+
+            weight_sum[
+                :, :, latent_y : latent_y + input_size, latent_x : latent_x + input_size
+            ] += latent_window
+
+            print(f"\rSampling tile {tile_index}/{total_tiles}", end="", flush=True)
+
+    print()
+
+    full_latent = latent_sum / weight_sum.clamp_min(1e-8)
+
+    if hasattr(model, "denormalize_latent"):
+        full_latent = model.denormalize_latent(full_latent)
+
+    with torch.autocast(
+        device_type=device.type,
+        dtype=torch.float16,
+        enabled=use_amp and device.type == "cuda",
+    ):
+        predicted_hsi = model.vae.decode(full_latent)
+
+    predicted_hsi = predicted_hsi.float().clamp(0.0, 1.0)
+    original_height, original_width = original_shape
+    return predicted_hsi[:, :, :original_height, :original_width]
+
+
+def percentile_stretch(image: np.ndarray) -> np.ndarray:
+    output = np.empty_like(image, dtype=np.float32)
+    for channel in range(image.shape[-1]):
+        values = image[..., channel]
+        low = np.percentile(values, 1.0)
+        high = np.percentile(values, 99.0)
+        output[..., channel] = np.clip(
+            (values - low) / (high - low + 1e-8), 0.0, 1.0
+        )
+    return output
+
+
+def make_pseudo_rgb(
+    hsi_chw: np.ndarray,
+    red_band: int,
+    green_band: int,
+    blue_band: int,
+) -> np.ndarray:
+    channels = hsi_chw.shape[0]
+    for band in (red_band, green_band, blue_band):
+        if band < 0 or band >= channels:
+            raise ValueError(
+                f"Band index {band} is invalid for a {channels}-band cube."
+            )
+
+    pseudo_rgb = np.stack(
+        [hsi_chw[red_band], hsi_chw[green_band], hsi_chw[blue_band]],
+        axis=-1,
+    )
+    return percentile_stretch(pseudo_rgb)
+
+
+def save_visualization(
+    rgb_hwc: np.ndarray,
+    hsi_chw: np.ndarray,
+    output_path: Path,
+    red_band: int,
+    green_band: int,
+    blue_band: int,
+) -> None:
+    pseudo_rgb = make_pseudo_rgb(
+        hsi_chw, red_band, green_band, blue_band
+    )
+    mean_spectrum = hsi_chw.mean(axis=(1, 2))
+
+    figure = plt.figure(figsize=(16, 9))
+
+    axis = figure.add_subplot(2, 3, 1)
+    axis.imshow(np.clip(rgb_hwc, 0.0, 1.0))
+    axis.set_title("Input full-resolution RGB")
+    axis.axis("off")
+
+    axis = figure.add_subplot(2, 3, 2)
+    axis.imshow(pseudo_rgb)
+    axis.set_title(
+        f"Predicted HSI pseudo-RGB\nR/G/B bands: {red_band}/{green_band}/{blue_band}"
+    )
+    axis.axis("off")
+
+    for plot_index, band_index in enumerate(
+        [blue_band, green_band, red_band], start=3
+    ):
+        axis = figure.add_subplot(2, 3, plot_index)
+        band_image = axis.imshow(hsi_chw[band_index], cmap="viridis")
+        axis.set_title(f"Predicted band {band_index}")
+        axis.axis("off")
+        figure.colorbar(band_image, ax=axis, fraction=0.046, pad=0.04)
+
+    axis = figure.add_subplot(2, 3, 6)
+    axis.plot(np.arange(hsi_chw.shape[0]), mean_spectrum, marker="o", markersize=3)
+    axis.set_title("Spatial mean spectrum")
+    axis.set_xlabel("Band index")
+    axis.set_ylabel("Mean reflectance")
+    axis.grid(alpha=0.25)
+
+    figure.tight_layout()
+    figure.savefig(output_path, dpi=200, bbox_inches="tight")
+    plt.close(figure)
+
+
+def main() -> None:
+    # ============================================================
+    # User-editable configuration
+    # ============================================================
+    RGB_PATH = "/kaggle/input/datasets/sriramhari14/ntire-2022/Train_RGB/Train_RGB/ARAD_1K_0003.jpg"
+    CHECKPOINT_PATH = "./diffusion_checkpoints/best_diffusion.pth"
+    VAE_CHECKPOINT_PATH = None  # Set only if needed
+    OUTPUT_DIR = "./full_resolution_result"
+
+    TILE_SIZE = 256
+    OVERLAP = 64
+    NUM_INFERENCE_STEPS = 100
+    SEED = 42
+    USE_AMP = True
+
+    # Pseudo-RGB band selection for visualization
+    RED_BAND = 20
+    GREEN_BAND = 15
+    BLUE_BAND = 5
+    # ============================================================
+
+    device = torch.device(
+        "cuda" if torch.cuda.is_available() else "cpu"
+    )
+
+    use_amp = bool(
+        USE_AMP and device.type == "cuda"
+    )
+
+    output_dir = Path(OUTPUT_DIR)
+    output_dir.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+
+    print(f"Device: {device}")
+    print(f"Mixed precision: {use_amp}")
+
+    model, config = load_model(
+        checkpoint_path=CHECKPOINT_PATH,
+        vae_checkpoint_path=VAE_CHECKPOINT_PATH,
         device=device,
     )
 
-    for t_scalar in noise_scheduler.timesteps:
-        # Broadcast scalar timestep to batch dimension.
-        t_batch = t_scalar.unsqueeze(0).to(device)
+    rgb, rgb_hwc = load_rgb_image(RGB_PATH)
+    rgb = rgb.to(device)
 
-        # DiT predicts noise (and optionally sigma) from noisy latent + RGB.
-        pred = model.dit(zt, t_batch, rgb)
-
-        if model.dit.learn_sigma:
-            # Only the first half of channels is the noise prediction.
-            pred_noise = pred[:, :model.dit.in_channels]
-        else:
-            pred_noise = pred
-
-        # Scheduler computes z_{t-1} from z_t and the predicted noise.
-        scheduler_out = noise_scheduler.step(pred_noise, t_scalar, zt)
-        zt = scheduler_out.prev_sample
-
-    # Decode the final clean latent → HSI pixel space.
-    hsi_recon = model.vae.decode(zt)
-    hsi_recon = torch.clamp(hsi_recon, 0.0, 1.0)
-
-    return hsi_recon
-
-
-# ============================================================
-# Metrics
-# ============================================================
-
-def calculate_metrics(
-    target: torch.Tensor,
-    reconstruction: torch.Tensor,
-) -> dict:
-    """Input tensors: [C, H, W]."""
-    target         = target.float()
-    reconstruction = reconstruction.float()
-
-    abs_error  = torch.abs(reconstruction - target)
-    mrae_value = torch.mean(abs_error / (torch.abs(target) + 1e-6))
-
-    mse_value  = torch.mean((reconstruction - target).pow(2))
-    rmse_value = torch.sqrt(mse_value)
-    psnr_value = 10.0 * torch.log10(1.0 / (mse_value + 1e-10))
-
-    # SAM — spectral angle mapper
-    t_flat = target.permute(1, 2, 0).reshape(-1, target.shape[0])
-    r_flat = reconstruction.permute(1, 2, 0).reshape(-1, reconstruction.shape[0])
-
-    numerator   = torch.sum(t_flat * r_flat, dim=1)
-    denominator = (
-        torch.linalg.vector_norm(t_flat, dim=1)
-        * torch.linalg.vector_norm(r_flat, dim=1)
-    )
-    cosine      = (numerator / (denominator + 1e-8)).clamp(-1 + 1e-7, 1 - 1e-7)
-    sam_degrees = torch.mean(torch.acos(cosine)) * 180.0 / torch.pi
-
-    return {
-        "mrae": float(mrae_value.item()),
-        "rmse": float(rmse_value.item()),
-        "psnr": float(psnr_value.item()),
-        "sam":  float(sam_degrees.item()),
-    }
-
-
-# ============================================================
-# Visualization helpers
-# ============================================================
-
-def create_pseudo_rgb(
-    cube: np.ndarray,
-    rgb_bands: tuple[int, int, int],
-    low_values:  Optional[np.ndarray] = None,
-    high_values: Optional[np.ndarray] = None,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """cube: [C, H, W]. Returns contrast-stretched [H, W, 3] image."""
-    r, g, b = rgb_bands
-    rgb = np.stack([cube[r], cube[g], cube[b]], axis=-1)
-
-    if low_values is None:
-        low_values  = np.percentile(rgb, RGB_LOW_PERCENTILE,  axis=(0, 1), keepdims=True)
-    if high_values is None:
-        high_values = np.percentile(rgb, RGB_HIGH_PERCENTILE, axis=(0, 1), keepdims=True)
-
-    rgb = (rgb - low_values) / (high_values - low_values + 1e-8)
-    return np.clip(rgb, 0.0, 1.0), low_values, high_values
-
-
-def plot_result(
-    target:         torch.Tensor,
-    reconstruction: torch.Tensor,
-    rgb_input:      torch.Tensor,
-    file_name:      str,
-    output_dir:     Path,
-) -> None:
-    """
-    Four-panel figure:
-      [0,0] Input RGB   [0,1] Ground-truth HSI pseudo-RGB
-      [1,0] Prediction  [1,1] Spectral signatures
-    Plus an error-map inset.
-    """
-    target_np  = target.cpu().float().numpy()
-    pred_np    = reconstruction.cpu().float().numpy()
-    rgb_np     = rgb_input.cpu().float().numpy().transpose(1, 2, 0)  # (H,W,3)
-    rgb_np     = np.clip(rgb_np, 0.0, 1.0)
-
-    target_display = np.clip(target_np, 0.0, 1.0)
-    pred_display   = np.clip(pred_np,   0.0, 1.0)
-
-    gt_rgb,   lo, hi = create_pseudo_rgb(target_display, RGB_BANDS)
-    pred_rgb, _,  _  = create_pseudo_rgb(pred_display,   RGB_BANDS, lo, hi)
-
-    error_map = np.mean(np.abs(pred_np - target_np), axis=0)
-    metrics   = calculate_metrics(target, reconstruction)
-
-    fig, axes = plt.subplots(2, 3, figsize=(18, 10))
-
-    # ── Row 0 ─────────────────────────────────────────────────────────────────
-    axes[0, 0].imshow(rgb_np)
-    axes[0, 0].set_title("Input RGB condition")
-    axes[0, 0].axis("off")
-
-    axes[0, 1].imshow(gt_rgb)
-    axes[0, 1].set_title("Ground-truth HSI pseudo-RGB")
-    axes[0, 1].axis("off")
-
-    axes[0, 2].imshow(pred_rgb)
-    axes[0, 2].set_title("Predicted HSI pseudo-RGB")
-    axes[0, 2].axis("off")
-
-    # ── Row 1 ─────────────────────────────────────────────────────────────────
-    err_img = axes[1, 0].imshow(error_map, cmap="magma")
-    axes[1, 0].set_title("Mean absolute error (all bands)")
-    axes[1, 0].axis("off")
-    fig.colorbar(err_img, ax=axes[1, 0], fraction=0.046, pad=0.04)
-
-    # Band-wise mean error
-    band_error = np.mean(np.abs(pred_np - target_np), axis=(1, 2))
-    axes[1, 1].bar(np.arange(len(band_error)), band_error, color="steelblue", alpha=0.8)
-    axes[1, 1].set_title("Per-band mean absolute error")
-    axes[1, 1].set_xlabel("Spectral band index")
-    axes[1, 1].set_ylabel("Mean |error|")
-    axes[1, 1].grid(alpha=0.3)
-
-    # Spectral signatures at selected pixel locations
-    h, w = target_np.shape[1], target_np.shape[2]
-    band_axis = np.arange(target_np.shape[0])
-    for loc_idx, (ry, rx) in enumerate(SPECTRAL_LOCATIONS, start=1):
-        y = int(ry * (h - 1))
-        x = int(rx * (w - 1))
-        line = axes[1, 2].plot(
-            band_axis, target_np[:, y, x],
-            linewidth=2, label=f"GT point {loc_idx} ({y},{x})"
-        )[0]
-        axes[1, 2].plot(
-            band_axis, pred_np[:, y, x],
-            linestyle="--", linewidth=2,
-            color=line.get_color(), label=f"Pred point {loc_idx}"
+    num_train_timesteps = int(
+        config.get(
+            "num_train_timesteps",
+            config.get("T", 1000),
         )
-    axes[1, 2].set_title("Spectral signatures")
-    axes[1, 2].set_xlabel("Spectral band index")
-    axes[1, 2].set_ylabel("Intensity")
-    axes[1, 2].legend(fontsize=8, ncol=2)
-    axes[1, 2].grid(alpha=0.3)
-
-    fig.suptitle(
-        f"{file_name}\n"
-        f"MRAE: {metrics['mrae']:.6f} | "
-        f"RMSE: {metrics['rmse']:.6f} | "
-        f"PSNR: {metrics['psnr']:.3f} dB | "
-        f"SAM: {metrics['sam']:.3f}°",
-        fontsize=13,
     )
-    fig.tight_layout(rect=(0.0, 0.0, 1.0, 0.94))
 
-    if SAVE_FIGURES:
-        output_dir.mkdir(parents=True, exist_ok=True)
-        out_path = output_dir / f"{file_name}_diffusion_prediction.png"
-        fig.savefig(out_path, dpi=180, bbox_inches="tight")
-        print(f"Saved: {out_path}")
+    beta_schedule = str(
+        config.get(
+            "beta_schedule",
+            "squaredcos_cap_v2",
+        )
+    )
 
-    if SHOW_FIGURES:
-        plt.show()
+    scheduler = DDPMScheduler(
+        num_train_timesteps=num_train_timesteps,
+        beta_schedule=beta_schedule,
+        prediction_type="epsilon",
+        clip_sample=False,
+    )
 
-    plt.close(fig)
+    predicted_hsi = predict_full_resolution(
+        model=model,
+        rgb=rgb,
+        scheduler=scheduler,
+        tile_size=TILE_SIZE,
+        overlap=OVERLAP,
+        num_inference_steps=NUM_INFERENCE_STEPS,
+        seed=SEED,
+        use_amp=use_amp,
+    )
+
+    hsi_chw = (
+        predicted_hsi[0]
+        .detach()
+        .cpu()
+        .numpy()
+        .astype(np.float32)
+    )
+
+    np.save(
+        output_dir / "predicted_hsi.npy",
+        hsi_chw,
+    )
+
+    sio.savemat(
+        output_dir / "predicted_hsi.mat",
+        {
+            "cube": np.transpose(
+                hsi_chw,
+                (1, 2, 0),
+            )
+        },
+    )
+
+    save_visualization(
+        rgb_hwc=rgb_hwc,
+        hsi_chw=hsi_chw,
+        output_path=output_dir / "visualization.png",
+        red_band=RED_BAND,
+        green_band=GREEN_BAND,
+        blue_band=BLUE_BAND,
+    )
 
     print(
-        f"Metrics for {file_name}: "
-        f"MRAE={metrics['mrae']:.6f}, "
-        f"RMSE={metrics['rmse']:.6f}, "
-        f"PSNR={metrics['psnr']:.3f} dB, "
-        f"SAM={metrics['sam']:.3f}°"
+        "Predicted HSI shape:",
+        tuple(hsi_chw.shape),
     )
-
-
-# ============================================================
-# Main
-# ============================================================
-
-@torch.inference_mode()
-def main() -> None:
-    set_seed(SEED)
-
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"Device: {device}")
-
-    model = load_model(CHECKPOINT_PATH, device)
-
-    noise_scheduler = DDPMScheduler(
-        num_train_timesteps=NUM_TRAIN_TIMESTEPS,
-        beta_schedule=BETA_SCHEDULE,
+    print(
+        "Saved:",
+        output_dir / "predicted_hsi.npy",
     )
-
-    all_pairs = pair_hsi_rgb_files(HSI_DATA_DIR, RGB_DATA_DIR)
-
-    rng = random.Random(SEED)
-    rng.shuffle(all_pairs)
-
-    output_dir = Path(OUTPUT_DIR)
-    processed  = 0
-
-    for hsi_path, rgb_path in all_pairs:
-        if processed >= NUM_IMAGES:
-            break
-
-        try:
-            # ── Load HSI (ground truth) ───────────────────────────────────────
-            cube = load_hsi_file(hsi_path)
-            cube = convert_to_chw(cube, HSI_CHANNELS, hsi_path)
-
-            if not np.isfinite(cube).all():
-                raise ValueError("HSI cube contains NaN or Inf values.")
-
-            cube = normalize_cube(cube, NORMALIZATION)
-            hsi  = torch.from_numpy(np.ascontiguousarray(cube)).float()
-
-            # ── Load RGB ──────────────────────────────────────────────────────
-            rgb_array = load_rgb_file(rgb_path)
-            rgb       = torch.from_numpy(np.ascontiguousarray(rgb_array)).float()
-
-            # ── Crop to patch size ────────────────────────────────────────────
-            hsi, rgb = center_crop_pair(hsi, rgb, PATCH_SIZE_PX)
-
-            # ── Add batch dimension: [C,H,W] → [1,C,H,W] ─────────────────────
-            hsi_batch = hsi.unsqueeze(0).to(device)
-            rgb_batch = rgb.unsqueeze(0).to(device)
-
-            print(f"\nFile: {hsi_path.name}")
-            print(f"  HSI input shape: {tuple(hsi_batch.shape)}")
-            print(f"  RGB input shape: {tuple(rgb_batch.shape)}")
-            print(f"  Running {NUM_INFERENCE_STEPS}-step denoising loop...")
-
-            # ── Full reverse diffusion → HSI reconstruction ───────────────────
-            hsi_recon_batch = denoise(
-                model=model,
-                rgb=rgb_batch,
-                noise_scheduler=noise_scheduler,
-                device=device,
-                num_inference_steps=NUM_INFERENCE_STEPS,
-            )
-
-            print(f"  Output shape: {tuple(hsi_recon_batch.shape)}")
-
-            # Remove batch dim for plotting: [1,C,H,W] → [C,H,W]
-            hsi_recon = hsi_recon_batch[0]
-            target    = hsi_batch[0]
-
-            plot_result(
-                target=target,
-                reconstruction=hsi_recon,
-                rgb_input=rgb_batch[0],
-                file_name=hsi_path.stem,
-                output_dir=output_dir,
-            )
-
-            processed += 1
-
-        except Exception as error:
-            print(
-                f"\nSkipping {hsi_path.name}: "
-                f"{type(error).__name__}: {error}"
-            )
-
-    if processed == 0:
-        raise RuntimeError("No files were successfully visualized.")
-
-    print(f"\nCompleted: {processed} visualization(s) saved to {output_dir.resolve()}")
+    print(
+        "Saved:",
+        output_dir / "predicted_hsi.mat",
+    )
+    print(
+        "Saved:",
+        output_dir / "visualization.png",
+    )
 
 
 if __name__ == "__main__":
     main()
+
