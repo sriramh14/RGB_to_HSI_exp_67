@@ -1356,7 +1356,7 @@ class RGB_to_HSI_w_diffusion(nn.Module):
             hsi_recon = self.vae.decode(z0_pred)
             hsi_recon = torch.clamp(hsi_recon, 0.0, 1.0)
         
-        return loss, hsi_recon, pred_noise
+        return loss, hsi_recon, pred_noise, noise
 
     def train(self, mode: bool = True):
         super().train(mode)
