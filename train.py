@@ -863,6 +863,7 @@ class HSIPatchDataset(Dataset):
         normalization,
         augment,
         include_full_resolution=True,
+        sample_mode="crop"
     ):
         self.files = files
         self.hsi_channels = hsi_channels
@@ -872,6 +873,7 @@ class HSIPatchDataset(Dataset):
         self.normalization = normalization
         self.augment = augment
         self.include_full_resolution = include_full_resolution
+        self.sample_mode = sample_mode
 
     def __len__(self):
 
@@ -941,28 +943,24 @@ class HSIPatchDataset(Dataset):
         ####################################################
     
         if self.training:
-    
-            if mode == "full":
-    
-                # keep original resolution
+
+            if self.sample_mode == "full":
+        
+                if self.augment:
+                    cube = spatial_augmentation(cube)
+        
                 return cube
-    
-            elif mode == "flip":
-    
-                cube = spatial_augmentation(cube)
-    
-                return cube
-    
-            else:
-    
+        
+            elif self.sample_mode == "crop":
+        
                 cube = random_crop(
                     cube,
                     self.patch_size,
                 )
-    
+        
                 if self.augment:
                     cube = spatial_augmentation(cube)
-    
+        
                 return cube
 
         ####################################################
@@ -1100,12 +1098,14 @@ def calculate_aux_losses (
 
 def train_one_epoch(
     model: HSIVAE,
-    loader: DataLoader,
+    full_loader : DataLoader,
+    crop_loader : Data:oader,
     optimizer: torch.optim.Optimizer,
     scaler: GradScaler,
     device: torch.device,
     use_amp: bool,
     epoch,
+    model,
 ) -> dict:
     model.train()
 
@@ -1120,7 +1120,158 @@ def train_one_epoch(
     total_samples = 0
 
     kl_weight = get_kl_weight(epoch)
-    for batch_index, hsi in enumerate(loader, start=1):
+    for batch_index, hsi in enumerate(full_loader, start=1):
+        hsi = hsi.to(
+            device,
+            non_blocking=True,
+        )
+
+        optimizer.zero_grad(
+            set_to_none=True
+        )
+
+        with autocast(enabled=use_amp):
+            reconstruction, mu, logvar, _ = model(
+                hsi,
+                sample=True,
+            )
+
+            (
+                loss,
+                reconstruction_value,
+                kl_value,
+            ) = calculate_vae_loss(
+                reconstruction=reconstruction,
+                target=hsi,
+                mu=mu,
+                logvar=logvar,
+                KL_WEIGHT = kl_weight
+            )
+            
+
+        if not torch.isfinite(loss):
+            raise FloatingPointError(
+                f"Non-finite training loss: {loss.item()}"
+            )
+
+        scaler.scale(loss).backward()
+
+        scaler.unscale_(optimizer)
+
+        torch.nn.utils.clip_grad_norm_(
+            model.parameters(),
+            max_norm=GRADIENT_CLIP_NORM,
+        )
+
+        scaler.step(optimizer)
+        scaler.update()
+        with torch.no_grad():
+            (
+                mrae_value,
+                rmse_value,
+                sam_value,
+                psnr_value,
+                ssim_value,
+            ) = calculate_aux_losses(
+                reconstruction=reconstruction.detach(),
+                target=hsi.detach(),
+                mu=mu.detach(),
+                logvar=logvar.detach(),
+            )
+
+        batch_size = hsi.size(0)
+
+        total_loss += (
+            loss.detach().item()
+            * batch_size
+        )
+
+        total_reconstruction += (
+            reconstruction_value.detach().item()
+            * batch_size
+        )
+
+        total_kl += (
+            kl_value.detach().item()
+            * batch_size
+        )
+        total_mrae += (
+            mrae_value.detach().item()
+            * batch_size
+        )
+        
+        total_rmse += (
+            rmse_value.detach().item()
+            * batch_size
+        )
+        
+        total_sam += (
+            sam_value.detach().item()
+            * batch_size
+        )
+        
+        total_psnr += (
+            psnr_value.detach().item()
+            * batch_size
+        )
+        
+        total_ssim += (
+            ssim_value.detach().item()
+            * batch_size
+        )
+
+        total_samples += batch_size
+        if (
+            batch_index % PRINT_EVERY == 0
+            or batch_index == len(loader)
+        ):
+            average_total_loss = (
+                total_loss / total_samples
+            )
+        
+            average_reconstruction_loss = (
+                total_reconstruction / total_samples
+            )
+        
+            average_kl_loss = (
+                total_kl / total_samples
+            )
+            
+            average_mrae_loss = (
+                total_mrae / total_samples
+            )
+            
+            average_rmse_loss = (
+                total_rmse / total_samples
+            )
+            
+            average_sam_loss = (
+                total_sam / total_samples
+            )
+            
+            average_psnr_loss = (
+                total_psnr / total_samples
+            )
+            
+            average_ssim_loss = (
+                total_ssim / total_samples
+            )
+            
+        
+            print(
+                f"  Batch {batch_index:04d}/{len(loader):04d} | "
+                f"Running total: {average_total_loss:.6f} | "
+                f"Running recon: "
+                f"{average_reconstruction_loss:.6f} | "
+                f"Running KL: {average_kl_loss:.6f}"
+                f" Running MRAE: {average_mrae_loss:.6f}"
+                f" Running RMSE: {average_rmse_loss:.6f}"
+                f" Running SAM: {average_sam_loss:.6f}"
+                f" Running PSNR: {average_psnr_loss:.6f}"
+                f" Running SSIM: {average_ssim_loss:.6f}"
+            )
+
+    for batch_index, hsi in enumerate(crop_loader, start=1):
         hsi = hsi.to(
             device,
             non_blocking=True,
@@ -1547,14 +1698,26 @@ def main() -> None:
         f"{len(validation_files)}"
     )
 
-    training_dataset = HSIPatchDataset(
+    training_full_dataset = HSIPatchDataset(
+        files=training_files,
+        hsi_channels=HSI_CHANNELS,
+        patch_size=PATCH_SIZE,
+        patches_per_image=1,
+        training=True,
+        normalization=NORMALIZATION,
+        augment=True,
+        sample_mode="full",
+    )
+    
+    training_crop_dataset = HSIPatchDataset(
         files=training_files,
         hsi_channels=HSI_CHANNELS,
         patch_size=PATCH_SIZE,
         patches_per_image=PATCHES_PER_IMAGE,
         training=True,
         normalization=NORMALIZATION,
-        augment=USE_AUGMENTATION,
+        augment=True,
+        sample_mode="crop",
     )
 
     validation_dataset = HSIPatchDataset(
@@ -1567,8 +1730,17 @@ def main() -> None:
         augment=False,
     )
 
-    training_loader = DataLoader(
-        training_dataset,
+    training_full_loader = DataLoader(
+        training_full_dataset,
+        batch_size=1,
+        shuffle=True,
+        num_workers=NUM_WORKERS,
+        pin_memory=device.type == "cuda",
+        persistent_workers=NUM_WORKERS > 0,
+    )
+    
+    training_crop_loader = DataLoader(
+        training_crop_dataset,
         batch_size=BATCH_SIZE,
         shuffle=True,
         num_workers=NUM_WORKERS,
@@ -1794,12 +1966,13 @@ def main() -> None:
     ):
         training_metrics = train_one_epoch(
             model=model,
-            loader=training_loader,
+            full_loader=training_full_loader,
+            crop_loader=training_crop_loader,
             optimizer=optimizer,
             scaler=scaler,
             device=device,
             use_amp=use_amp,
-            epoch = epoch
+            epoch=epoch,
         )
 
         validation_metrics = validate(
