@@ -1105,7 +1105,6 @@ def train_one_epoch(
     device: torch.device,
     use_amp: bool,
     epoch,
-    model,
 ) -> dict:
     model.train()
 
