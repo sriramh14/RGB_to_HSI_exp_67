@@ -1099,7 +1099,7 @@ def calculate_aux_losses (
 def train_one_epoch(
     model: HSIVAE,
     full_loader : DataLoader,
-    crop_loader : Data:oader,
+    crop_loader : DataLoader,
     optimizer: torch.optim.Optimizer,
     scaler: GradScaler,
     device: torch.device,
