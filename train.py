@@ -1227,7 +1227,7 @@ def train_one_epoch(
         total_samples += batch_size
         if (
             batch_index % PRINT_EVERY == 0
-            or batch_index == len(loader)
+            or batch_index == len(full_loader)
         ):
             average_total_loss = (
                 total_loss / total_samples
@@ -1378,7 +1378,7 @@ def train_one_epoch(
         total_samples += batch_size
         if (
             batch_index % PRINT_EVERY == 0
-            or batch_index == len(loader)
+            or batch_index == len(crop_loader)
         ):
             average_total_loss = (
                 total_loss / total_samples
