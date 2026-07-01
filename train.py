@@ -32,7 +32,7 @@ OUTPUT_DIR = "./vae_checkpoints"
 # Resume-training configuration
 # ============================================================
 
-RESUME_TRAINING = True
+RESUME_TRAINING = False
 
 # Use last_vae.pth to continue from the final completed epoch.
 # Use best_vae.pth to fine-tune from the best validation checkpoint.
@@ -51,8 +51,8 @@ HSI_KEY = "cube"
 VALIDATION_CACHE = Path(OUTPUT_DIR) / "hsi_validation_cache.pth"
 
 HSI_CHANNELS = 31
-PATCH_SIZE = 512
-PATCHES_PER_IMAGE = 1
+PATCH_SIZE = 128
+PATCHES_PER_IMAGE = 4
 
 BASE_CHANNELS = 64
 LATENT_CHANNELS = 16
@@ -855,13 +855,14 @@ def spatial_augmentation(
 class HSIPatchDataset(Dataset):
     def __init__(
         self,
-        files: List[Path],
-        hsi_channels: int,
-        patch_size: int,
-        patches_per_image: int,
-        training: bool,
-        normalization: str,
-        augment: bool,
+        files,
+        hsi_channels,
+        patch_size,
+        patches_per_image,
+        training,
+        normalization,
+        augment,
+        include_full_resolution=True,
     ):
         self.files = files
         self.hsi_channels = hsi_channels
@@ -870,69 +871,110 @@ class HSIPatchDataset(Dataset):
         self.training = training
         self.normalization = normalization
         self.augment = augment
+        self.include_full_resolution = include_full_resolution
 
-    def __len__(self) -> int:
-        if self.training:
-            return (
-                len(self.files)
-                * self.patches_per_image
-            )
+    def __len__(self):
 
-        return len(self.files)
+        if not self.training:
+            return len(self.files)
+    
+        multiplier = self.patches_per_image
+    
+        if self.include_full_resolution:
+            multiplier += 2      # original + flipped
+    
+        return len(self.files) * multiplier
 
-    def __getitem__(
-        self,
-        index: int,
-    ) -> torch.Tensor:
-        if self.training:
-            file_index = (
-                index
-                // self.patches_per_image
-            )
-        else:
+    def __getitem__(self, index):
+
+        if not self.training:
+    
             file_index = index
-
-        file_path = self.files[file_index]
-
-        cube = load_hsi_file(file_path)
-
-        cube = convert_to_chw(
-            cube=cube,
-            hsi_channels=self.hsi_channels,
-            file_path=file_path,
-        )
-
-        if not np.isfinite(cube).all():
-            raise ValueError(
-                f"NaN or infinite values found in {file_path}"
+            mode = "val"
+    
+        else:
+    
+            samples_per_image = (
+                self.patches_per_image
+                + (2 if self.include_full_resolution else 0)
             )
-
+    
+            file_index = index // samples_per_image
+    
+            sample_type = index % samples_per_image
+    
+            if self.include_full_resolution:
+    
+                if sample_type == 0:
+                    mode = "full"
+    
+                elif sample_type == 1:
+                    mode = "flip"
+    
+                else:
+                    mode = "crop"
+    
+            else:
+                mode = "crop"
+    
+        file_path = self.files[file_index]
+    
+        cube = load_hsi_file(file_path)
+    
+        cube = convert_to_chw(
+            cube,
+            self.hsi_channels,
+            file_path,
+        )
+    
         cube = normalize_cube(
             cube,
             self.normalization,
         )
-
+    
         cube = torch.from_numpy(
             cube.copy()
         ).float()
-
+    
+        ####################################################
+        # Training samples
+        ####################################################
+    
         if self.training:
-            cube = random_crop(
-                cube,
-                self.patch_size,
-            )
-
-            if self.augment:
+    
+            if mode == "full":
+    
+                # keep original resolution
+                return cube
+    
+            elif mode == "flip":
+    
                 cube = spatial_augmentation(cube)
+    
+                return cube
+    
+            else:
+    
+                cube = random_crop(
+                    cube,
+                    self.patch_size,
+                )
+    
+                if self.augment:
+                    cube = spatial_augmentation(cube)
+    
+                return cube
 
-        else:
-            cube = center_crop(
-                cube,
-                self.patch_size,
-            )
-
+        ####################################################
+        # Validation
+        ####################################################
+    
+        cube = center_crop(
+            cube,
+            self.patch_size,
+        )
+    
         return cube
-
 
 # ============================================================
 # Train-validation split
