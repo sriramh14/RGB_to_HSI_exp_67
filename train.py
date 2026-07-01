@@ -32,7 +32,7 @@ OUTPUT_DIR = "./vae_checkpoints"
 # Resume-training configuration
 # ============================================================
 
-RESUME_TRAINING = False
+RESUME_TRAINING = True
 
 # Use last_vae.pth to continue from the final completed epoch.
 # Use best_vae.pth to fine-tune from the best validation checkpoint.
@@ -51,8 +51,8 @@ HSI_KEY = "cube"
 VALIDATION_CACHE = Path(OUTPUT_DIR) / "hsi_validation_cache.pth"
 
 HSI_CHANNELS = 31
-PATCH_SIZE = 128
-PATCHES_PER_IMAGE = 4
+PATCH_SIZE = 512
+PATCHES_PER_IMAGE = 1
 
 BASE_CHANNELS = 64
 LATENT_CHANNELS = 16
@@ -855,15 +855,13 @@ def spatial_augmentation(
 class HSIPatchDataset(Dataset):
     def __init__(
         self,
-        files,
-        hsi_channels,
-        patch_size,
-        patches_per_image,
-        training,
-        normalization,
-        augment,
-        include_full_resolution=True,
-        sample_mode="crop"
+        files: List[Path],
+        hsi_channels: int,
+        patch_size: int,
+        patches_per_image: int,
+        training: bool,
+        normalization: str,
+        augment: bool,
     ):
         self.files = files
         self.hsi_channels = hsi_channels
@@ -872,107 +870,69 @@ class HSIPatchDataset(Dataset):
         self.training = training
         self.normalization = normalization
         self.augment = augment
-        self.include_full_resolution = include_full_resolution
-        self.sample_mode = sample_mode
 
-    def __len__(self):
-
-        if not self.training:
-            return len(self.files)
-    
-        multiplier = self.patches_per_image
-    
-        if self.include_full_resolution:
-            multiplier += 2      # original + flipped
-    
-        return len(self.files) * multiplier
-
-    def __getitem__(self, index):
-
-        if not self.training:
-    
-            file_index = index
-            mode = "val"
-    
-        else:
-    
-            samples_per_image = (
-                self.patches_per_image
-                + (2 if self.include_full_resolution else 0)
+    def __len__(self) -> int:
+        if self.training:
+            return (
+                len(self.files)
+                * self.patches_per_image
             )
-    
-            file_index = index // samples_per_image
-    
-            sample_type = index % samples_per_image
-    
-            if self.include_full_resolution:
-    
-                if sample_type == 0:
-                    mode = "full"
-    
-                elif sample_type == 1:
-                    mode = "flip"
-    
-                else:
-                    mode = "crop"
-    
-            else:
-                mode = "crop"
-    
+
+        return len(self.files)
+
+    def __getitem__(
+        self,
+        index: int,
+    ) -> torch.Tensor:
+        if self.training:
+            file_index = (
+                index
+                // self.patches_per_image
+            )
+        else:
+            file_index = index
+
         file_path = self.files[file_index]
-    
+
         cube = load_hsi_file(file_path)
-    
+
         cube = convert_to_chw(
-            cube,
-            self.hsi_channels,
-            file_path,
+            cube=cube,
+            hsi_channels=self.hsi_channels,
+            file_path=file_path,
         )
-    
+
+        if not np.isfinite(cube).all():
+            raise ValueError(
+                f"NaN or infinite values found in {file_path}"
+            )
+
         cube = normalize_cube(
             cube,
             self.normalization,
         )
-    
+
         cube = torch.from_numpy(
             cube.copy()
         ).float()
-    
-        ####################################################
-        # Training samples
-        ####################################################
-    
+
         if self.training:
+            cube = random_crop(
+                cube,
+                self.patch_size,
+            )
 
-            if self.sample_mode == "full":
-        
-                if self.augment:
-                    cube = spatial_augmentation(cube)
-        
-                return cube
-        
-            elif self.sample_mode == "crop":
-        
-                cube = random_crop(
-                    cube,
-                    self.patch_size,
-                )
-        
-                if self.augment:
-                    cube = spatial_augmentation(cube)
-        
-                return cube
+            if self.augment:
+                cube = spatial_augmentation(cube)
 
-        ####################################################
-        # Validation
-        ####################################################
-    
-        cube = center_crop(
-            cube,
-            self.patch_size,
-        )
-    
+        else:
+            cube = center_crop(
+                cube,
+                self.patch_size,
+            )
+
         return cube
+
 
 # ============================================================
 # Train-validation split
@@ -1098,8 +1058,7 @@ def calculate_aux_losses (
 
 def train_one_epoch(
     model: HSIVAE,
-    full_loader : DataLoader,
-    crop_loader : DataLoader,
+    loader: DataLoader,
     optimizer: torch.optim.Optimizer,
     scaler: GradScaler,
     device: torch.device,
@@ -1119,163 +1078,7 @@ def train_one_epoch(
     total_samples = 0
 
     kl_weight = get_kl_weight(epoch)
-    for batch_index, hsi in enumerate(full_loader, start=1):
-        hsi = hsi.to(
-            device,
-            non_blocking=True,
-        )
-
-        optimizer.zero_grad(
-            set_to_none=True
-        )
-
-        with autocast(enabled=use_amp):
-            reconstruction, mu, logvar, _ = model(
-                hsi,
-                sample=True,
-            )
-            reconstruction = F.pad(
-                reconstruction,
-                (0, 2, 0, 0),   # pad 2 pixels on the right
-                mode="replicate",
-            )
-
-            (
-                loss,
-                reconstruction_value,
-                kl_value,
-            ) = calculate_vae_loss(
-                reconstruction=reconstruction,
-                target=hsi,
-                mu=mu,
-                logvar=logvar,
-                KL_WEIGHT = kl_weight
-            )
-            
-
-        if not torch.isfinite(loss):
-            raise FloatingPointError(
-                f"Non-finite training loss: {loss.item()}"
-            )
-
-        scaler.scale(loss).backward()
-
-        scaler.unscale_(optimizer)
-
-        torch.nn.utils.clip_grad_norm_(
-            model.parameters(),
-            max_norm=GRADIENT_CLIP_NORM,
-        )
-
-        scaler.step(optimizer)
-        scaler.update()
-        with torch.no_grad():
-            (
-                mrae_value,
-                rmse_value,
-                sam_value,
-                psnr_value,
-                ssim_value,
-            ) = calculate_aux_losses(
-                reconstruction=reconstruction.detach(),
-                target=hsi.detach(),
-                mu=mu.detach(),
-                logvar=logvar.detach(),
-            )
-
-        batch_size = hsi.size(0)
-
-        total_loss += (
-            loss.detach().item()
-            * batch_size
-        )
-
-        total_reconstruction += (
-            reconstruction_value.detach().item()
-            * batch_size
-        )
-
-        total_kl += (
-            kl_value.detach().item()
-            * batch_size
-        )
-        total_mrae += (
-            mrae_value.detach().item()
-            * batch_size
-        )
-        
-        total_rmse += (
-            rmse_value.detach().item()
-            * batch_size
-        )
-        
-        total_sam += (
-            sam_value.detach().item()
-            * batch_size
-        )
-        
-        total_psnr += (
-            psnr_value.detach().item()
-            * batch_size
-        )
-        
-        total_ssim += (
-            ssim_value.detach().item()
-            * batch_size
-        )
-
-        total_samples += batch_size
-        if (
-            batch_index % PRINT_EVERY == 0
-            or batch_index == len(full_loader)
-        ):
-            average_total_loss = (
-                total_loss / total_samples
-            )
-        
-            average_reconstruction_loss = (
-                total_reconstruction / total_samples
-            )
-        
-            average_kl_loss = (
-                total_kl / total_samples
-            )
-            
-            average_mrae_loss = (
-                total_mrae / total_samples
-            )
-            
-            average_rmse_loss = (
-                total_rmse / total_samples
-            )
-            
-            average_sam_loss = (
-                total_sam / total_samples
-            )
-            
-            average_psnr_loss = (
-                total_psnr / total_samples
-            )
-            
-            average_ssim_loss = (
-                total_ssim / total_samples
-            )
-            
-        
-            print(
-                f"  Batch {batch_index:04d}/{len(loader):04d} | "
-                f"Running total: {average_total_loss:.6f} | "
-                f"Running recon: "
-                f"{average_reconstruction_loss:.6f} | "
-                f"Running KL: {average_kl_loss:.6f}"
-                f" Running MRAE: {average_mrae_loss:.6f}"
-                f" Running RMSE: {average_rmse_loss:.6f}"
-                f" Running SAM: {average_sam_loss:.6f}"
-                f" Running PSNR: {average_psnr_loss:.6f}"
-                f" Running SSIM: {average_ssim_loss:.6f}"
-            )
-
-    for batch_index, hsi in enumerate(crop_loader, start=1):
+    for batch_index, hsi in enumerate(loader, start=1):
         hsi = hsi.to(
             device,
             non_blocking=True,
@@ -1378,7 +1181,7 @@ def train_one_epoch(
         total_samples += batch_size
         if (
             batch_index % PRINT_EVERY == 0
-            or batch_index == len(crop_loader)
+            or batch_index == len(loader)
         ):
             average_total_loss = (
                 total_loss / total_samples
@@ -1702,26 +1505,14 @@ def main() -> None:
         f"{len(validation_files)}"
     )
 
-    training_full_dataset = HSIPatchDataset(
-        files=training_files,
-        hsi_channels=HSI_CHANNELS,
-        patch_size=PATCH_SIZE,
-        patches_per_image=1,
-        training=True,
-        normalization=NORMALIZATION,
-        augment=True,
-        sample_mode="full",
-    )
-    
-    training_crop_dataset = HSIPatchDataset(
+    training_dataset = HSIPatchDataset(
         files=training_files,
         hsi_channels=HSI_CHANNELS,
         patch_size=PATCH_SIZE,
         patches_per_image=PATCHES_PER_IMAGE,
         training=True,
         normalization=NORMALIZATION,
-        augment=True,
-        sample_mode="crop",
+        augment=USE_AUGMENTATION,
     )
 
     validation_dataset = HSIPatchDataset(
@@ -1734,17 +1525,8 @@ def main() -> None:
         augment=False,
     )
 
-    training_full_loader = DataLoader(
-        training_full_dataset,
-        batch_size=1,
-        shuffle=True,
-        num_workers=NUM_WORKERS,
-        pin_memory=device.type == "cuda",
-        persistent_workers=NUM_WORKERS > 0,
-    )
-    
-    training_crop_loader = DataLoader(
-        training_crop_dataset,
+    training_loader = DataLoader(
+        training_dataset,
         batch_size=BATCH_SIZE,
         shuffle=True,
         num_workers=NUM_WORKERS,
@@ -1970,13 +1752,12 @@ def main() -> None:
     ):
         training_metrics = train_one_epoch(
             model=model,
-            full_loader=training_full_loader,
-            crop_loader=training_crop_loader,
+            loader=training_loader,
             optimizer=optimizer,
             scaler=scaler,
             device=device,
             use_amp=use_amp,
-            epoch=epoch,
+            epoch = epoch
         )
 
         validation_metrics = validate(
