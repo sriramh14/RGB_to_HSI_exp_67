@@ -1134,6 +1134,11 @@ def train_one_epoch(
                 hsi,
                 sample=True,
             )
+            reconstruction = F.pad(
+                reconstruction,
+                (0, 2, 0, 0),   # pad 2 pixels on the right
+                mode="replicate",
+            )
 
             (
                 loss,
