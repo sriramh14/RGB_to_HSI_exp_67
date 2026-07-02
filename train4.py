@@ -62,7 +62,7 @@ VAE_DOWNSAMPLE_FACTOR = 4
 
 # Training uses native-resolution cubes as the source, then samples random crops.
 TRAIN_CROP_SIZE = 256
-CROPS_PER_IMAGE = 2
+CROPS_PER_IMAGE = 4
 
 # Spatial augmentation. These transforms preserve spectral values and apply the
 # exact same spatial operation to every HSI band.
