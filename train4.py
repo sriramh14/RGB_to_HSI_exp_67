@@ -93,7 +93,7 @@ PRINT_EVERY = 30
 RECONSTRUCTION_LOSS = "mse"  # "mse", "l1", or "smooth_l1"
 KL_BETA_START = 0.0
 KL_BETA_END = 1e-3
-KL_WARMUP_EPOCHS = 30
+KL_WARMUP_EPOCHS = 40
 
 # The best checkpoint is selected using validation total loss.
 VALIDATION_CACHE = Path(OUTPUT_DIR) / "vae_validation_cache.pth"
