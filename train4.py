@@ -94,7 +94,7 @@ PRINT_EVERY = 30
 # Reconstruction and KL settings.
 RECONSTRUCTION_LOSS = "mse"  # "mse", "l1", or "smooth_l1"
 KL_BETA_START = 0.0
-KL_BETA_END = 1e-3
+KL_BETA_END = 1e-5
 KL_WARMUP_EPOCHS = 60
 
 # The best checkpoint is selected using validation total loss.
