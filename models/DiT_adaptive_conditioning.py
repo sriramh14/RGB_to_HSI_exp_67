@@ -26,42 +26,135 @@ def modulate(x, shift, scale):
 
 
 
+class RGBUNetBlock(nn.Module):
+    """Two-convolution U-Net block using channel-wise LayerNorm."""
+
+    def __init__(
+        self,
+        in_channels: int,
+        out_channels: int,
+    ):
+        super().__init__()
+        self.conv1 = nn.Conv2d(
+            in_channels,
+            out_channels,
+            kernel_size=3,
+            padding=1,
+        )
+        self.norm1 = nn.LayerNorm(
+            out_channels,
+            eps=1e-6,
+        )
+        self.conv2 = nn.Conv2d(
+            out_channels,
+            out_channels,
+            kernel_size=3,
+            padding=1,
+        )
+        self.norm2 = nn.LayerNorm(
+            out_channels,
+            eps=1e-6,
+        )
+        self.activation = nn.SiLU()
+
+    @staticmethod
+    def _apply_layer_norm_nchw(
+        feature: torch.Tensor,
+        norm: nn.LayerNorm,
+    ) -> torch.Tensor:
+        feature = feature.permute(0, 2, 3, 1)
+        feature = norm(feature)
+        return feature.permute(0, 3, 1, 2).contiguous()
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = self.conv1(x)
+        x = self._apply_layer_norm_nchw(x, self.norm1)
+        x = self.activation(x)
+
+        x = self.conv2(x)
+        x = self._apply_layer_norm_nchw(x, self.norm2)
+        x = self.activation(x)
+        return x
+
+
+class RGBSkipFusionBlock(nn.Module):
+    """
+    U-Net top-down fusion block.
+
+    The lower-resolution feature is resized to the skip resolution, projected,
+    concatenated with the gated encoder skip, and refined by a convolutional
+    block. This explicitly connects global -> regional -> local information.
+    """
+
+    def __init__(
+        self,
+        lower_channels: int,
+        skip_channels: int,
+        out_channels: int,
+    ):
+        super().__init__()
+        self.lower_projection = nn.Conv2d(
+            lower_channels,
+            out_channels,
+            kernel_size=1,
+        )
+        self.skip_projection = nn.Conv2d(
+            skip_channels,
+            out_channels,
+            kernel_size=1,
+        )
+        self.fusion = RGBUNetBlock(
+            2 * out_channels,
+            out_channels,
+        )
+
+    def forward(
+        self,
+        lower_feature: torch.Tensor,
+        skip_feature: torch.Tensor,
+        skip_weight: torch.Tensor,
+    ) -> torch.Tensor:
+        lower_feature = F.interpolate(
+            lower_feature,
+            size=skip_feature.shape[-2:],
+            mode="bilinear",
+            align_corners=False,
+        )
+        lower_feature = self.lower_projection(lower_feature)
+        skip_feature = self.skip_projection(skip_feature)
+
+        # skip_weight has shape [B, 1, 1, 1]. It controls when the finer
+        # encoder feature is allowed to enter the top-down path.
+        skip_feature = skip_weight * skip_feature
+
+        return self.fusion(
+            torch.cat(
+                [lower_feature, skip_feature],
+                dim=1,
+            )
+        )
+
+
 class RGBConditionEncoder(nn.Module):
     """
-    Global-to-local RGB condition encoder for a diffusion/DiT backbone.
+    U-Net-style RGB conditioning adapter for the diffusion/DiT backbone.
 
-    Design:
-        1. Uses PyTorch nn.LayerNorm directly; no GroupNorm or custom norm class.
-        2. Preserves a persistent global condition using learned attention pooling.
-        3. Builds global, regional, and local spatial RGB token streams.
-        4. Uses independent, non-normalized timestep gates:
-               global:   1.0 -> 0.65 and remains dominant
-               regional: 0.0 -> 0.35 and remains second
-               local:    0.0 -> 0.25, activated only near the end
-        5. Converts regional/local streams into hierarchical residual refinements:
-               regional_delta = regional - global
-               local_delta    = local - regional
-        6. Keeps the streams separate until learned concatenation-based fusion.
-        7. Produces a bounded, gated residual spatial update so late local
-           conditioning refines rather than replaces the existing DiT structure.
+    Encoder half:
+        RGB -> local feature -> regional feature -> global bottleneck.
 
-    Standard diffusion convention:
-        t = num_timesteps - 1 : highly noisy / start of reverse denoising
-        t = 0                 : nearly clean / end of reverse denoising
+    Top-down skip path:
+        global bottleneck -> regional skip fusion -> local skip fusion.
+
+    The global bottleneck supplies the persistent AdaLN condition. The final
+    local-resolution fused feature supplies the spatial DiT residual. Regional
+    and local skip strengths are controlled by the diffusion timestep, so
+    coarse/global information dominates noisy timesteps while finer RGB detail
+    is introduced later in denoising.
 
     Returns:
-        global_condition:
-            Tensor [B, hidden_size].
-            Persistent scene/material condition intended for DiT AdaLN.
-
-        spatial_update:
-            Tensor [B, token_grid_size**2, hidden_size].
-            Bounded residual update aligned with the DiT latent tokens.
-
-        field_weights:
-            Tensor [B, 3].
-            Independent [global, regional, local] branch strengths.
-            These values are intentionally NOT normalized to sum to one.
+        global_condition: [B, hidden_size]
+        spatial_update:   [B, token_grid_size**2, hidden_size]
+        field_weights:    [B, 3] in [global, regional, local] order
     """
 
     def __init__(
@@ -88,35 +181,26 @@ class RGBConditionEncoder(nn.Module):
                 f"but received hidden_size={hidden_size} and "
                 f"num_attention_heads={num_attention_heads}."
             )
-
         if token_grid_size < 1:
             raise ValueError("token_grid_size must be at least 1.")
-
         if num_timesteps < 2:
             raise ValueError("num_timesteps must be at least 2.")
-
         if not 0.0 <= global_end <= 1.0:
             raise ValueError("global_end must lie in [0, 1].")
-
         if not 0.0 <= regional_max <= 1.0:
             raise ValueError("regional_max must lie in [0, 1].")
-
         if not 0.0 < regional_end <= 1.0:
             raise ValueError("regional_end must lie in (0, 1].")
-
         if not 0.0 <= local_max <= 1.0:
             raise ValueError("local_max must lie in [0, 1].")
-
         if not 0.0 <= local_start < 1.0:
             raise ValueError("local_start must lie in [0, 1).")
-
         if not 0.0 < max_update_strength <= 1.0:
             raise ValueError("max_update_strength must lie in (0, 1].")
 
         self.hidden_size = hidden_size
         self.token_grid_size = token_grid_size
         self.num_timesteps = num_timesteps
-
         self.global_grid_size = min(global_grid_size, token_grid_size)
         self.regional_grid_size = min(regional_grid_size, token_grid_size)
 
@@ -128,198 +212,117 @@ class RGBConditionEncoder(nn.Module):
         self.max_update_strength = max_update_strength
 
         base_channels = max(hidden_size // 4, 32)
-
-        self.activation = nn.SiLU()
-
-        # ------------------------------------------------------------------ #
-        # Local RGB features: highest spatial resolution / smallest field.
-        # ------------------------------------------------------------------ #
-        self.local_conv1 = nn.Conv2d(
-            3,
-            base_channels,
-            kernel_size=3,
-            padding=1,
-        )
-        self.local_norm1 = nn.LayerNorm(
-            base_channels,
-            eps=1e-6,
-        )
-
-        self.local_conv2 = nn.Conv2d(
-            base_channels,
-            base_channels,
-            kernel_size=3,
-            padding=1,
-        )
-        self.local_norm2 = nn.LayerNorm(
-            base_channels,
-            eps=1e-6,
-        )
+        regional_channels = 2 * base_channels
+        global_channels = hidden_size
 
         # ------------------------------------------------------------------ #
-        # Regional RGB features: intermediate resolution / larger field.
+        # U-Net encoder half: local -> regional -> global.
         # ------------------------------------------------------------------ #
-        self.regional_conv1 = nn.Conv2d(
+        self.local_encoder = RGBUNetBlock(
+            in_channels=3,
+            out_channels=base_channels,
+        )
+
+        self.local_to_regional = nn.Conv2d(
             base_channels,
-            base_channels * 2,
+            regional_channels,
             kernel_size=3,
             stride=2,
             padding=1,
         )
-        self.regional_norm1 = nn.LayerNorm(
-            base_channels * 2,
-            eps=1e-6,
+        self.regional_encoder = RGBUNetBlock(
+            in_channels=regional_channels,
+            out_channels=regional_channels,
         )
 
-        self.regional_conv2 = nn.Conv2d(
-            base_channels * 2,
-            base_channels * 2,
-            kernel_size=3,
-            padding=1,
-        )
-        self.regional_norm2 = nn.LayerNorm(
-            base_channels * 2,
-            eps=1e-6,
-        )
-
-        # ------------------------------------------------------------------ #
-        # Global RGB features: lowest resolution / largest field.
-        # ------------------------------------------------------------------ #
-        self.global_conv1 = nn.Conv2d(
-            base_channels * 2,
-            hidden_size,
+        self.regional_to_global = nn.Conv2d(
+            regional_channels,
+            global_channels,
             kernel_size=3,
             stride=2,
             padding=1,
         )
-        self.global_norm1 = nn.LayerNorm(
-            hidden_size,
-            eps=1e-6,
-        )
-
-        self.global_conv2 = nn.Conv2d(
-            hidden_size,
-            hidden_size,
-            kernel_size=3,
-            stride=2,
-            padding=1,
-        )
-        self.global_norm2 = nn.LayerNorm(
-            hidden_size,
-            eps=1e-6,
-        )
-
-        # Convert all scales to hidden_size channels.
-        self.local_map_projection = nn.Conv2d(
-            base_channels,
-            hidden_size,
-            kernel_size=1,
-        )
-        self.regional_map_projection = nn.Conv2d(
-            base_channels * 2,
-            hidden_size,
-            kernel_size=1,
-        )
-        self.global_map_projection = nn.Conv2d(
-            hidden_size,
-            hidden_size,
-            kernel_size=1,
+        self.global_encoder = RGBUNetBlock(
+            in_channels=global_channels,
+            out_channels=global_channels,
         )
 
         # ------------------------------------------------------------------ #
-        # Learned global pooling.
-        #
-        # Unlike AdaptiveAvgPool2d(1), learned queries can attend to different
-        # regions/materials before producing the global AdaLN condition.
+        # U-Net top-down path. These are the requested skip connections:
+        #     global bottleneck + regional encoder skip
+        #     fused regional feature + local encoder skip
+        # ------------------------------------------------------------------ #
+        self.global_to_regional_fusion = RGBSkipFusionBlock(
+            lower_channels=global_channels,
+            skip_channels=regional_channels,
+            out_channels=regional_channels,
+        )
+        self.regional_to_local_fusion = RGBSkipFusionBlock(
+            lower_channels=regional_channels,
+            skip_channels=base_channels,
+            out_channels=base_channels,
+        )
+
+        # ------------------------------------------------------------------ #
+        # Learned global pooling from the U-Net bottleneck.
         # ------------------------------------------------------------------ #
         self.global_queries = nn.Parameter(
             torch.randn(
                 1,
                 num_global_queries,
                 hidden_size,
-            )
-            * 0.02
+            ) * 0.02
         )
-
         self.global_token_norm = nn.LayerNorm(
             hidden_size,
             eps=1e-6,
         )
-
         self.global_attention_pool = nn.MultiheadAttention(
             embed_dim=hidden_size,
             num_heads=num_attention_heads,
             batch_first=True,
         )
-
         self.global_query_norm = nn.LayerNorm(
             hidden_size,
             eps=1e-6,
         )
-
         self.global_condition_projection = nn.Sequential(
             nn.Linear(hidden_size, hidden_size),
             nn.SiLU(),
             nn.Linear(hidden_size, hidden_size),
         )
 
-        # Branch-specific token normalization before residual decomposition.
-        self.global_spatial_norm = nn.LayerNorm(
+        # Multi-scale contexts used only by the safety gate. The actual spatial
+        # update comes from the final local-resolution skip-fused feature.
+        self.global_context_projection = nn.Conv2d(
+            global_channels,
+            hidden_size,
+            kernel_size=1,
+        )
+        self.regional_context_projection = nn.Conv2d(
+            regional_channels,
+            hidden_size,
+            kernel_size=1,
+        )
+        self.local_context_projection = nn.Conv2d(
+            base_channels,
+            hidden_size,
+            kernel_size=1,
+        )
+
+        self.global_context_norm = nn.LayerNorm(
             hidden_size,
             eps=1e-6,
         )
-        self.regional_spatial_norm = nn.LayerNorm(
+        self.regional_context_norm = nn.LayerNorm(
             hidden_size,
             eps=1e-6,
         )
-        self.local_spatial_norm = nn.LayerNorm(
+        self.local_context_norm = nn.LayerNorm(
             hidden_size,
             eps=1e-6,
         )
 
-        # Branch-specific projections preserve the identity of each scale.
-        self.global_branch_projection = nn.Linear(
-            hidden_size,
-            hidden_size,
-        )
-        self.regional_branch_projection = nn.Linear(
-            hidden_size,
-            hidden_size,
-        )
-        self.local_branch_projection = nn.Linear(
-            hidden_size,
-            hidden_size,
-        )
-
-        # Normalize branch outputs after projection so the schedule strengths
-        # remain comparable. Non-affine LayerNorm prevents a branch from
-        # learning an arbitrary scale that defeats global dominance.
-        self.global_branch_norm = nn.LayerNorm(
-            hidden_size,
-            eps=1e-6,
-            elementwise_affine=False,
-        )
-        self.regional_branch_norm = nn.LayerNorm(
-            hidden_size,
-            eps=1e-6,
-            elementwise_affine=False,
-        )
-        self.local_branch_norm = nn.LayerNorm(
-            hidden_size,
-            eps=1e-6,
-            elementwise_affine=False,
-        )
-
-        # Shared output projection applied only after the ordered hierarchical
-        # branches have been combined. Because it cannot see the branches
-        # separately, it cannot learn to arbitrarily amplify the local branch
-        # relative to the global branch.
-        self.spatial_output_projection = nn.Linear(
-            hidden_size,
-            hidden_size,
-        )
-
-        # Per-token, per-channel safety gate.
         self.spatial_gate = nn.Sequential(
             nn.LayerNorm(3 * hidden_size, eps=1e-6),
             nn.Linear(3 * hidden_size, hidden_size),
@@ -328,41 +331,29 @@ class RGBConditionEncoder(nn.Module):
             nn.Sigmoid(),
         )
 
-        # Learnable scalar, bounded by max_update_strength.
-        # Initial value -2 gives a small residual update at initialization.
-        self.update_strength_logit = nn.Parameter(
-            torch.tensor(-2.0)
+        # This name is retained because DiT.initialize_weights() explicitly
+        # restores its zero initialization after applying generic Linear init.
+        self.spatial_output_projection = nn.Linear(
+            hidden_size,
+            hidden_size,
         )
-
         self.output_norm = nn.LayerNorm(
             hidden_size,
             eps=1e-6,
         )
 
+        self.update_strength_logit = nn.Parameter(
+            torch.tensor(-2.0)
+        )
+
         self._initialize_safe_fusion()
 
     def _initialize_safe_fusion(self) -> None:
-        """
-        Start the spatial-conditioning pathway at exactly zero so it cannot
-        overwrite the existing DiT representation at initialization.
-        """
+        # Start with a zero RGB spatial residual. This preserves the original
+        # DiT behaviour at initialization while allowing gradients to train the
+        # adapter through this projection.
         nn.init.zeros_(self.spatial_output_projection.weight)
         nn.init.zeros_(self.spatial_output_projection.bias)
-
-    @staticmethod
-    def _apply_layer_norm_nchw(
-        feature: torch.Tensor,
-        norm: nn.LayerNorm,
-    ) -> torch.Tensor:
-        """
-        Apply the PyTorch nn.LayerNorm module across channels at each spatial
-        location.
-
-        NCHW -> NHWC -> LayerNorm(C) -> NCHW
-        """
-        feature = feature.permute(0, 2, 3, 1)
-        feature = norm(feature)
-        return feature.permute(0, 3, 1, 2).contiguous()
 
     @staticmethod
     def _smoothstep(value: torch.Tensor) -> torch.Tensor:
@@ -373,179 +364,88 @@ class RGBConditionEncoder(nn.Module):
         self,
         t: torch.Tensor,
     ) -> torch.Tensor:
-        """
-        Produce independent, non-normalized branch strengths.
-
-        Denoising progress:
-            progress = 0 at the noisy endpoint
-            progress = 1 at the clean endpoint
-        """
         progress = 1.0 - (
             t.float() / float(self.num_timesteps - 1)
         )
         progress = progress.clamp(0.0, 1.0)
 
-        # Global field starts at 1.0 and smoothly drops to global_end.
         global_weight = (
             self.global_end
             + (1.0 - self.global_end)
             * (1.0 - progress).pow(2)
         )
 
-        # Regional field grows to regional_max and remains below global.
         regional_progress = progress / self.regional_end
         regional_weight = (
             self.regional_max
             * self._smoothstep(regional_progress)
         )
 
-        # Local field stays off until the final denoising segment and then
-        # grows to local_max while remaining below regional and global.
         local_progress = (
             progress - self.local_start
         ) / max(1.0 - self.local_start, 1e-6)
-
         local_weight = (
             self.local_max
             * self._smoothstep(local_progress)
         )
 
-        # Intentionally not normalized.
         return torch.stack(
-            [
-                global_weight,
-                regional_weight,
-                local_weight,
-            ],
+            [global_weight, regional_weight, local_weight],
             dim=1,
         )
-
-    def _resize_to_token_grid(
-        self,
-        feature: torch.Tensor,
-        source_grid_size: int,
-    ) -> torch.Tensor:
-        """
-        Compress a feature to its intended field size and then resize it to the
-        common DiT token grid.
-
-        Example:
-            global branch   -> coarse 4x4 representation
-            regional branch -> medium 8x8 representation
-            local branch    -> full token_grid_size representation
-        """
-        feature = F.adaptive_avg_pool2d(
-            feature,
-            output_size=(
-                source_grid_size,
-                source_grid_size,
-            ),
-        )
-
-        if source_grid_size != self.token_grid_size:
-            feature = F.interpolate(
-                feature,
-                size=(
-                    self.token_grid_size,
-                    self.token_grid_size,
-                ),
-                mode="bilinear",
-                align_corners=False,
-            )
-
-        return feature
 
     @staticmethod
     def _to_tokens(
         feature: torch.Tensor,
     ) -> torch.Tensor:
-        # [B, D, H, W] -> [B, H*W, D]
         return feature.flatten(2).transpose(1, 2)
 
-    def _extract_features(
+    def _context_to_tokens(
         self,
-        rgb: torch.Tensor,
-    ):
-        local = self.local_conv1(rgb)
-        local = self._apply_layer_norm_nchw(
-            local,
-            self.local_norm1,
+        feature: torch.Tensor,
+        projection: nn.Conv2d,
+        norm: nn.LayerNorm,
+        source_grid_size: int,
+    ) -> torch.Tensor:
+        # First preserve the intended receptive-field scale, then align all
+        # branches to the fixed DiT token grid.
+        feature = F.adaptive_avg_pool2d(
+            feature,
+            output_size=(source_grid_size, source_grid_size),
         )
-        local = self.activation(local)
-
-        local = self.local_conv2(local)
-        local = self._apply_layer_norm_nchw(
-            local,
-            self.local_norm2,
-        )
-        local = self.activation(local)
-
-        regional = self.regional_conv1(local)
-        regional = self._apply_layer_norm_nchw(
-            regional,
-            self.regional_norm1,
-        )
-        regional = self.activation(regional)
-
-        regional = self.regional_conv2(regional)
-        regional = self._apply_layer_norm_nchw(
-            regional,
-            self.regional_norm2,
-        )
-        regional = self.activation(regional)
-
-        global_feature = self.global_conv1(regional)
-        global_feature = self._apply_layer_norm_nchw(
-            global_feature,
-            self.global_norm1,
-        )
-        global_feature = self.activation(global_feature)
-
-        global_feature = self.global_conv2(global_feature)
-        global_feature = self._apply_layer_norm_nchw(
-            global_feature,
-            self.global_norm2,
-        )
-        global_feature = self.activation(global_feature)
-
-        return local, regional, global_feature
+        if source_grid_size != self.token_grid_size:
+            feature = F.interpolate(
+                feature,
+                size=(self.token_grid_size, self.token_grid_size),
+                mode="bilinear",
+                align_corners=False,
+            )
+        feature = projection(feature)
+        return norm(self._to_tokens(feature))
 
     def _build_global_condition(
         self,
-        global_map_native: torch.Tensor,
+        global_feature: torch.Tensor,
     ) -> torch.Tensor:
-        """
-        Produce the persistent [B, D] global condition using learned attention
-        pooling rather than ordinary global average pooling.
-        """
-        global_tokens_native = self._to_tokens(
-            global_map_native
+        global_tokens = self.global_token_norm(
+            self._to_tokens(global_feature)
         )
-        global_tokens_native = self.global_token_norm(
-            global_tokens_native
-        )
-
         queries = self.global_queries.expand(
-            global_tokens_native.shape[0],
+            global_tokens.shape[0],
             -1,
             -1,
         )
-
         pooled_queries, _ = self.global_attention_pool(
             query=queries,
-            key=global_tokens_native,
-            value=global_tokens_native,
+            key=global_tokens,
+            value=global_tokens,
             need_weights=False,
         )
-
         pooled_queries = self.global_query_norm(
             pooled_queries + queries
         )
-
         global_condition = pooled_queries.mean(dim=1)
-        return self.global_condition_projection(
-            global_condition
-        )
+        return self.global_condition_projection(global_condition)
 
     def forward(
         self,
@@ -557,139 +457,94 @@ class RGBConditionEncoder(nn.Module):
                 "rgb must have shape [B, 3, H, W], "
                 f"but received {tuple(rgb.shape)}."
             )
-
         if t.ndim != 1 or t.shape[0] != rgb.shape[0]:
             raise ValueError(
                 "t must have shape [B] and match the RGB batch size. "
                 f"Received t={tuple(t.shape)} and rgb={tuple(rgb.shape)}."
             )
 
-        local_feature, regional_feature, global_feature = (
-            self._extract_features(rgb)
-        )
+        # ----------------------- encoder half ---------------------------- #
+        local_skip = self.local_encoder(rgb)
 
-        # Project all feature levels to hidden_size channels.
-        local_map_native = self.local_map_projection(
-            local_feature
-        )
-        regional_map_native = self.regional_map_projection(
-            regional_feature
-        )
-        global_map_native = self.global_map_projection(
-            global_feature
-        )
+        regional_input = self.local_to_regional(local_skip)
+        regional_skip = self.regional_encoder(regional_input)
 
-        # Persistent global vector for AdaLN.
-        global_condition = self._build_global_condition(
-            global_map_native
-        )
-
-        # Build spatial maps with deliberately different fields of view.
-        global_map = self._resize_to_token_grid(
-            global_map_native,
-            self.global_grid_size,
-        )
-
-        regional_map = self._resize_to_token_grid(
-            regional_map_native,
-            self.regional_grid_size,
-        )
-
-        local_map = self._resize_to_token_grid(
-            local_map_native,
-            self.token_grid_size,
-        )
-
-        global_tokens = self.global_spatial_norm(
-            self._to_tokens(global_map)
-        )
-        regional_tokens = self.regional_spatial_norm(
-            self._to_tokens(regional_map)
-        )
-        local_tokens = self.local_spatial_norm(
-            self._to_tokens(local_map)
-        )
-
-        # Hierarchical residual decomposition:
-        # local/regional branches add missing detail instead of replacing the
-        # complete global representation.
-        regional_delta = regional_tokens - global_tokens
-        local_delta = local_tokens - regional_tokens
-
-        global_branch = self.global_branch_norm(
-            self.global_branch_projection(
-                global_tokens
-            )
-        )
-        regional_branch = self.regional_branch_norm(
-            self.regional_branch_projection(
-                regional_delta
-            )
-        )
-        local_branch = self.local_branch_norm(
-            self.local_branch_projection(
-                local_delta
-            )
-        )
+        global_input = self.regional_to_global(regional_skip)
+        global_bottleneck = self.global_encoder(global_input)
 
         field_weights = self._field_weights(t)
+        w_global = field_weights[:, 0].view(-1, 1, 1, 1)
+        w_regional = field_weights[:, 1].view(-1, 1, 1, 1)
+        w_local = field_weights[:, 2].view(-1, 1, 1, 1)
 
-        w_global = field_weights[:, 0, None, None]
-        w_regional = field_weights[:, 1, None, None]
-        w_local = field_weights[:, 2, None, None]
-
-        weighted_global = w_global * global_branch
-        weighted_regional = w_regional * regional_branch
-        weighted_local = w_local * local_branch
-
-        # Since regional_branch and local_branch are hierarchical residuals,
-        # addition is meaningful here: global establishes the base and the
-        # smaller branches add bounded refinements.
-        ordered_update = (
-            weighted_global
-            + weighted_regional
-            + weighted_local
+        # Persistent global vector is kept independent of the spatial skip
+        # schedule so RGB scene/material information is always available.
+        global_condition = self._build_global_condition(
+            global_bottleneck
         )
 
-        # The gate may inspect all branches, but it only gates the already
-        # ordered combined update; it cannot rescale one branch independently.
+        # ---------------------- top-down skip path ----------------------- #
+        # Global controls the top-down base; regional and local information
+        # enters through the corresponding gated encoder skips.
+        global_top_down = w_global * global_bottleneck
+
+        regional_fused = self.global_to_regional_fusion(
+            lower_feature=global_top_down,
+            skip_feature=regional_skip,
+            skip_weight=w_regional,
+        )
+
+        local_fused = self.regional_to_local_fusion(
+            lower_feature=regional_fused,
+            skip_feature=local_skip,
+            skip_weight=w_local,
+        )
+
+        # Build aligned contexts for the safety gate. regional_fused already
+        # includes global context; local_fused includes all three levels.
+        global_context = self._context_to_tokens(
+            feature=global_top_down,
+            projection=self.global_context_projection,
+            norm=self.global_context_norm,
+            source_grid_size=self.global_grid_size,
+        )
+        regional_context = self._context_to_tokens(
+            feature=regional_fused,
+            projection=self.regional_context_projection,
+            norm=self.regional_context_norm,
+            source_grid_size=self.regional_grid_size,
+        )
+        local_context = self._context_to_tokens(
+            feature=local_fused,
+            projection=self.local_context_projection,
+            norm=self.local_context_norm,
+            source_grid_size=self.token_grid_size,
+        )
+
         branch_context = torch.cat(
-            [
-                weighted_global,
-                weighted_regional,
-                weighted_local,
-            ],
+            [global_context, regional_context, local_context],
             dim=-1,
         )
+        safety_gate = self.spatial_gate(branch_context)
 
-        safety_gate = self.spatial_gate(
-            branch_context
-        )
-
+        # local_context is the final skip-fused U-Net feature and therefore
+        # already contains global, regional, and local information.
         projected_update = self.spatial_output_projection(
-            ordered_update
+            local_context
         )
-        projected_update = self.output_norm(
-            projected_update
-        )
+        projected_update = self.output_norm(projected_update)
 
         update_strength = (
             self.max_update_strength
             * torch.sigmoid(self.update_strength_logit)
         )
-
         spatial_update = (
             update_strength
             * safety_gate
             * projected_update
         )
 
-        return (
-            global_condition,
-            spatial_update,
-            field_weights,
-        )
-
+        return global_condition, spatial_update, field_weights
 
 
 #################################################################################
