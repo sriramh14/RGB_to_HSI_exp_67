@@ -10,6 +10,8 @@ Key behaviour
 6. Images are padded only immediately before the VAE forward pass so their height
    and width are compatible with the VAE downsampling factor. The reconstruction
    is cropped back to the original size before losses and metrics are calculated.
+7. Per-channel posterior latent mean and standard deviation are calculated from
+   full-resolution validation images and saved in every checkpoint.
 """
 
 from __future__ import annotations
@@ -62,7 +64,7 @@ VAE_DOWNSAMPLE_FACTOR = 4
 
 # Training uses native-resolution cubes as the source, then samples random crops.
 TRAIN_CROP_SIZE = 256
-CROPS_PER_IMAGE = 1
+CROPS_PER_IMAGE = 4
 
 # Spatial augmentation. These transforms preserve spectral values and apply the
 # exact same spatial operation to every HSI band.
@@ -98,6 +100,13 @@ KL_WARMUP_EPOCHS = 30
 # The best checkpoint is selected using validation total loss.
 VALIDATION_CACHE = Path(OUTPUT_DIR) / "vae_validation_cache.pth"
 HSI_CHECKER_VERSION = "previous-script-metadata-cache-v1"
+
+# Latent statistics are computed from the validation posterior after each epoch.
+# For q(z|x) = N(mu, sigma^2), the code accumulates the exact moments
+# E[z] = E[mu] and E[z^2] = E[mu^2 + sigma^2], rather than drawing a noisy
+# random latent sample. Statistics are saved per latent channel.
+LATENT_STATISTICS_SOURCE = "validation_posterior"
+LATENT_STATISTICS_EPSILON = 1e-12
 
 
 # =============================================================================
@@ -814,6 +823,100 @@ def calculate_metrics(
 
 
 # =============================================================================
+# Latent-space statistics
+# =============================================================================
+
+
+class LatentMomentAccumulator:
+    """Accumulate exact first and second moments of q(z|x) per channel.
+
+    For a diagonal Gaussian posterior q(z|x) = N(mu, exp(logvar)):
+
+        E[z]   = mu
+        E[z^2] = mu^2 + exp(logvar)
+
+    Aggregating these quantities avoids Monte Carlo noise from sampling z.
+    The resulting mean/std describe posterior latent samples, not only mu.
+    """
+
+    def __init__(self) -> None:
+        self.channel_sum: torch.Tensor | None = None
+        self.channel_second_moment_sum: torch.Tensor | None = None
+        self.values_per_channel = 0
+        self.latent_channels: int | None = None
+
+    @torch.no_grad()
+    def update(self, mu: torch.Tensor, logvar: torch.Tensor) -> None:
+        if mu.shape != logvar.shape:
+            raise ValueError(
+                "mu and logvar must have the same shape, found "
+                f"{tuple(mu.shape)} and {tuple(logvar.shape)}"
+            )
+        if mu.ndim < 2:
+            raise ValueError(
+                "Expected latent tensors with shape [B,C,...], found "
+                f"{tuple(mu.shape)}"
+            )
+
+        mu64 = mu.detach().to(dtype=torch.float64)
+        variance64 = logvar.detach().to(dtype=torch.float64).exp()
+
+        reduce_dimensions = (0, *range(2, mu64.ndim))
+        batch_channel_sum = mu64.sum(dim=reduce_dimensions).cpu()
+        batch_second_sum = (mu64.square() + variance64).sum(
+            dim=reduce_dimensions
+        ).cpu()
+
+        channels = int(mu64.shape[1])
+        count = int(mu64.numel() // channels)
+
+        if self.channel_sum is None:
+            self.channel_sum = torch.zeros(channels, dtype=torch.float64)
+            self.channel_second_moment_sum = torch.zeros(
+                channels, dtype=torch.float64
+            )
+            self.latent_channels = channels
+        elif channels != self.latent_channels:
+            raise ValueError(
+                "Latent channel count changed while accumulating statistics: "
+                f"expected {self.latent_channels}, found {channels}."
+            )
+
+        self.channel_sum += batch_channel_sum
+        self.channel_second_moment_sum += batch_second_sum
+        self.values_per_channel += count
+
+    def finalize(self) -> Dict[str, Any]:
+        if (
+            self.channel_sum is None
+            or self.channel_second_moment_sum is None
+            or self.values_per_channel <= 0
+        ):
+            raise RuntimeError("No latent values were accumulated.")
+
+        mean64 = self.channel_sum / self.values_per_channel
+        second_moment64 = (
+            self.channel_second_moment_sum / self.values_per_channel
+        )
+        variance64 = torch.clamp(
+            second_moment64 - mean64.square(),
+            min=LATENT_STATISTICS_EPSILON,
+        )
+        std64 = variance64.sqrt()
+
+        return {
+            "mean": mean64.float(),
+            "std": std64.float(),
+            "variance": variance64.float(),
+            "second_moment": second_moment64.float(),
+            "values_per_channel": self.values_per_channel,
+            "latent_channels": int(self.latent_channels),
+            "source": LATENT_STATISTICS_SOURCE,
+            "method": "analytic_diagonal_gaussian_posterior_moments",
+        }
+
+
+# =============================================================================
 # Training and validation
 # =============================================================================
 
@@ -898,9 +1001,10 @@ def validate(
     device: torch.device,
     use_amp: bool,
     beta: float,
-) -> Dict[str, float]:
-    """Validate directly on every complete native-resolution HSI image."""
+) -> Tuple[Dict[str, float], Dict[str, Any]]:
+    """Validate on full images and accumulate posterior latent statistics."""
     model.eval()
+    latent_moments = LatentMomentAccumulator()
 
     totals = {
         "total_loss": 0.0,
@@ -925,6 +1029,8 @@ def validate(
             kl_loss = kl_divergence(mu, logvar)
             total_loss = recon_loss + beta * kl_loss
 
+        latent_moments.update(mu, logvar)
+
         if not torch.isfinite(total_loss):
             raise FloatingPointError(
                 f"Non-finite validation loss for shape {tuple(hsi.shape)}"
@@ -939,10 +1045,12 @@ def validate(
         for name, value in metrics.items():
             totals[name] += value
 
-    return {
+    validation_metrics = {
         name: value / max(image_count, 1)
         for name, value in totals.items()
     }
+    latent_statistics = latent_moments.finalize()
+    return validation_metrics, latent_statistics
 
 
 # =============================================================================
@@ -959,6 +1067,7 @@ def save_checkpoint(
     epoch: int,
     beta: float,
     validation_metrics: Dict[str, float],
+    latent_statistics: Dict[str, Any],
 ) -> None:
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -971,6 +1080,15 @@ def save_checkpoint(
             "scaler_state_dict": scaler.state_dict(),
             "kl_beta": beta,
             "validation_metrics": validation_metrics,
+            # Easy-to-use top-level tensors. Shape: [LATENT_CHANNELS].
+            # For diffusion normalization, reshape to [1, C, 1, 1].
+            "latent_mean": latent_statistics["mean"].cpu(),
+            "latent_std": latent_statistics["std"].cpu(),
+            # Complete metadata and additional moments.
+            "latent_statistics": {
+                key: value.cpu() if isinstance(value, torch.Tensor) else value
+                for key, value in latent_statistics.items()
+            },
             "model_config": {
                 "hsi_channels": HSI_CHANNELS,
                 "base_channels": BASE_CHANNELS,
@@ -986,6 +1104,7 @@ def save_checkpoint(
                 "kl_beta_end": KL_BETA_END,
                 "kl_warmup_epochs": KL_WARMUP_EPOCHS,
                 "use_augmentation": USE_AUGMENTATION,
+                "latent_statistics_source": LATENT_STATISTICS_SOURCE,
             },
         },
         output_path,
@@ -1029,6 +1148,14 @@ def main() -> None:
     print(f"Validation files: {len(validation_files)}")
     print(f"Training crop size: {TRAIN_CROP_SIZE} x {TRAIN_CROP_SIZE}")
     print("Validation mode: complete native-resolution images")
+    if USE_AUGMENTATION:
+        print(
+            "Training augmentation: augment_hsi() is called for every training "
+            "crop after random cropping. Each flip/rotation is stochastic, so "
+            "an individual crop can still receive an identity transform."
+        )
+    else:
+        print("Training augmentation: disabled")
 
     training_dataset = HSIDataset(
         files=training_files,
@@ -1122,7 +1249,7 @@ def main() -> None:
             beta=beta,
         )
 
-        validation_metrics = validate(
+        validation_metrics, latent_statistics = validate(
             model=model,
             loader=validation_loader,
             device=device,
@@ -1151,6 +1278,18 @@ def main() -> None:
             f"Val SSIM: {validation_metrics['ssim']:.4f}"
         )
 
+        latent_mean = latent_statistics["mean"]
+        latent_std = latent_statistics["std"]
+        print(
+            "  Latent posterior statistics | "
+            f"channels: {latent_statistics['latent_channels']} | "
+            f"mean range: [{latent_mean.min().item():.6f}, "
+            f"{latent_mean.max().item():.6f}] | "
+            f"std range: [{latent_std.min().item():.6f}, "
+            f"{latent_std.max().item():.6f}] | "
+            f"values/channel: {latent_statistics['values_per_channel']:,}"
+        )
+
         save_checkpoint(
             output_path=output_dir / "last_vae.pth",
             model=model,
@@ -1160,6 +1299,7 @@ def main() -> None:
             epoch=epoch,
             beta=beta,
             validation_metrics=validation_metrics,
+            latent_statistics=latent_statistics,
         )
 
         if validation_metrics["total_loss"] < best_validation_loss:
@@ -1173,6 +1313,7 @@ def main() -> None:
                 epoch=epoch,
                 beta=beta,
                 validation_metrics=validation_metrics,
+                latent_statistics=latent_statistics,
             )
             print(
                 "  New best checkpoint: "
