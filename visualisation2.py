@@ -394,7 +394,7 @@ def main() -> None:
     # User-editable configuration
     # ============================================================
     RGB_PATH = "/kaggle/input/datasets/sriramhari14/ntire-2022/Train_RGB/Train_RGB/ARAD_1K_0003.jpg"
-    CHECKPOINT_PATH = "./vae_checkpoints/best_diffusion.pth"
+    CHECKPOINT_PATH = "./diffusion_checkpoints/best_diffusion.pth"
     VAE_CHECKPOINT_PATH = None  # Set only if needed
     OUTPUT_DIR = "./full_resolution_result"
 
