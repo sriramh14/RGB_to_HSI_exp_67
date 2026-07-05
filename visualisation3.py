@@ -118,7 +118,7 @@ SPECTRAL_LOCATIONS = (
 # Use 1.0 for data normalized to [0, 1].
 DATA_RANGE = 1.0
 
-SEED = 42
+SEED = 67
 SAVE_FIGURES = True
 SHOW_FIGURES = True
 
