@@ -22,7 +22,7 @@ from torch.utils.data import DataLoader, Dataset
 # ============================================================================
 # Adjust only these import paths if your project layout is different.
 from models.HSI_VAE import HSIVAE
-from models.hsi_mmdit import RGBConditionedHSIMMDiT
+from models.MMDiT_rgb2hsi import RGBConditionedHSIMMDiT
 
 from loss.mrae import mrae
 from loss.psnr import psnr
