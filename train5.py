@@ -116,7 +116,7 @@ QK_NORM = True
 # The image size must be divisible by:
 # VAE_DOWNSAMPLE_FACTOR * MMDIT_PATCH_SIZE = 8 by default.
 TRAIN_CROP_SIZE = 256
-PATCHES_PER_IMAGE = 1
+PATCHES_PER_IMAGE = 2
 
 # Training.
 BATCH_SIZE = 2
