@@ -36,7 +36,7 @@ from loss.ssim import ssim
 # ============================================================================
 
 # "train", "infer", or "train_and_infer"
-RUN_MODE = "train"
+RUN_MODE = "infer"
 
 # Training data.
 TRAIN_HSI_DIR = (
