@@ -50,10 +50,10 @@ TRAIN_RGB_DIR = (
 
 # Validation data is intentionally in a separate pair of folders.
 VALIDATION_HSI_DIR = (
-    "/kaggle/input/datasets/sriramhari14/ntire-2022/Train_spectral/Train_spectral"
+    "/kaggle/input/datasets/sriramhari14/ntire-2022/Valid_spectral/Valid_spectral"
 )
 VALIDATION_RGB_DIR = (
-    "/kaggle/input/datasets/sriramhari14/ntire-2022/Train_RGB/Train_RGB"
+    "/kaggle/input/datasets/sriramhari14/ntire-2022/Valid_RGB/Valid_RGB"
 )
 
 # Used to initialise training. New MM-DiT checkpoints also contain the
@@ -2446,8 +2446,14 @@ def train_one_epoch(
                 message += (
                     f" | one-step MRAE="
                     f"{current_metrics['mrae']:.6f}"
+                    f" | one-step RMSE="
+                    f"{current_metrics['rmse']:.6f}"
                     f" | one-step SAM="
                     f"{current_metrics['sam']:.6f}"
+                    f" | one-step PSNR="
+                    f"{current_metrics['psnr']:.4f}"
+                    f" | one-step SSIM="
+                    f"{current_metrics['ssim']:.4f}"
                 )
 
             print(message)
@@ -3432,6 +3438,16 @@ def train_workflow(
             f"validation flow="
             f"{validation_flow['flow_loss']:.6f}"
         )
+
+        if "one_step_psnr" in train_metrics:
+            print(
+                "Training one-step reconstruction metrics | "
+                f"MRAE={train_metrics['one_step_mrae']:.6f} | "
+                f"RMSE={train_metrics['one_step_rmse']:.6f} | "
+                f"SAM={train_metrics['one_step_sam']:.6f} | "
+                f"PSNR={train_metrics['one_step_psnr']:.4f} | "
+                f"SSIM={train_metrics['one_step_ssim']:.4f}"
+            )
 
         print(
             "Validation full-sampling metrics | "
