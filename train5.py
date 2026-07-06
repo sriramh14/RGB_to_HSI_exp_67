@@ -50,10 +50,10 @@ TRAIN_RGB_DIR = (
 
 # Validation data is intentionally in a separate pair of folders.
 VALIDATION_HSI_DIR = (
-    "/kaggle/input/your-validation-dataset/Validation_spectral"
+    "/kaggle/input/datasets/sriramhari14/ntire-2022/Valid_spectral/Valid_spectral"
 )
 VALIDATION_RGB_DIR = (
-    "/kaggle/input/your-validation-dataset/Validation_RGB"
+    "/kaggle/input/datasets/sriramhari14/ntire-2022/Valid_RGB/Valid_RGB"
 )
 
 # Used to initialise training. New MM-DiT checkpoints also contain the
