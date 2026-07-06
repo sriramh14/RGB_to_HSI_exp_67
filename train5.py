@@ -50,10 +50,10 @@ TRAIN_RGB_DIR = (
 
 # Validation data is intentionally in a separate pair of folders.
 VALIDATION_HSI_DIR = (
-    "/kaggle/input/datasets/sriramhari14/ntire-2022/Valid_spectral/Valid_spectral"
+    "/kaggle/input/datasets/sriramhari14/ntire-2022/Train_spectral/Train_spectral"
 )
 VALIDATION_RGB_DIR = (
-    "/kaggle/input/datasets/sriramhari14/ntire-2022/Valid_RGB/Valid_RGB"
+    "/kaggle/input/datasets/sriramhari14/ntire-2022/Train_RGB/Train_RGB"
 )
 
 # Used to initialise training. New MM-DiT checkpoints also contain the
@@ -74,6 +74,11 @@ VALIDATION_PAIR_VALIDATION_CACHE = (
 # Used by RUN_MODE="infer". The best checkpoint is normally selected here.
 INFERENCE_CHECKPOINT = "./mmdit_checkpoints/best_mmdit.pth"
 RESUME_CHECKPOINT: Optional[str] = None
+
+# When recovering from a run that overflowed, retain model/optimizer moments but
+# reset the AMP scale and force the safer learning rate configured below.
+LOAD_SCALER_STATE_ON_RESUME = False
+OVERRIDE_RESUMED_LEARNING_RATE = True
 
 # Number of randomly selected full-resolution validation images in inference mode.
 NUM_RANDOM_INFERENCE_IMAGES = 5
@@ -116,19 +121,34 @@ QK_NORM = True
 # The image size must be divisible by:
 # VAE_DOWNSAMPLE_FACTOR * MMDIT_PATCH_SIZE = 8 by default.
 TRAIN_CROP_SIZE = 256
-PATCHES_PER_IMAGE = 2
+PATCHES_PER_IMAGE = 1
 
 # Training.
 BATCH_SIZE = 2
 VALIDATION_BATCH_SIZE = 2
 NUM_EPOCHS = 100
-LEARNING_RATE = 1e-4
+LEARNING_RATE = 5e-5
 WEIGHT_DECAY = 1e-4
 MIN_LEARNING_RATE = 1e-7
 GRADIENT_CLIP_NORM = 1.0
 
 NUM_WORKERS = 4
 USE_AMP = True
+
+# Prefer BF16 when the GPU supports it. BF16 has a much wider exponent range
+# than FP16 and is substantially less likely to overflow during backprop.
+PREFER_BFLOAT16 = True
+
+# Used only when FP16 GradScaler is active. The PyTorch default (65536) can be
+# too aggressive for this model and small batch size.
+FP16_INITIAL_SCALE = 1024.0
+FP16_GROWTH_INTERVAL = 2000
+
+# A single overflow should not terminate a long run. The affected optimizer
+# step is skipped and the FP16 scale is reduced. Persistent overflows still
+# raise an error so real divergence is not hidden.
+MAX_CONSECUTIVE_NONFINITE_GRADIENTS = 10
+
 USE_AUGMENTATION = True
 SEED = 42
 PRINT_EVERY = 30
@@ -189,13 +209,26 @@ def seed_worker(worker_id: int) -> None:
 # AMP helpers
 # ============================================================================
 
+def get_amp_dtype(
+    device: torch.device,
+) -> torch.dtype:
+    if (
+        device.type == "cuda"
+        and PREFER_BFLOAT16
+        and torch.cuda.is_bf16_supported()
+    ):
+        return torch.bfloat16
+
+    return torch.float16
+
+
 def autocast_context(
     device: torch.device,
     enabled: bool,
 ):
     return torch.autocast(
         device_type=device.type,
-        dtype=torch.float16,
+        dtype=get_amp_dtype(device),
         enabled=enabled,
     )
 
@@ -2210,6 +2243,9 @@ def train_one_epoch(
     metric_batches = 0
     timestep_tracker = create_timestep_tracker()
 
+    skipped_nonfinite_batches = 0
+    consecutive_nonfinite_batches = 0
+
     for batch_index, (hsi, rgb) in enumerate(
         loader,
         start=1,
@@ -2292,21 +2328,66 @@ def train_one_epoch(
         scaler.scale(loss).backward()
         scaler.unscale_(optimizer)
 
-        gradient_norm = (
-            torch.nn.utils.clip_grad_norm_(
-                trainable_parameters,
-                max_norm=GRADIENT_CLIP_NORM,
-            )
+        gradient_norm = torch.nn.utils.clip_grad_norm_(
+            trainable_parameters,
+            max_norm=GRADIENT_CLIP_NORM,
+            error_if_nonfinite=False,
         )
 
         if not torch.isfinite(gradient_norm):
+            skipped_nonfinite_batches += 1
+            consecutive_nonfinite_batches += 1
+
             optimizer.zero_grad(
                 set_to_none=True
             )
-            raise FloatingPointError(
-                f"Non-finite gradient norm at batch "
-                f"{batch_index}: {gradient_norm.item()}"
+
+            old_scale = (
+                float(scaler.get_scale())
+                if scaler.is_enabled()
+                else 1.0
             )
+
+            if scaler.is_enabled():
+                # Reset GradScaler's per-optimizer state and force a backoff.
+                new_scale = max(
+                    old_scale * 0.5,
+                    1.0,
+                )
+                scaler.update(
+                    new_scale=new_scale
+                )
+            else:
+                new_scale = old_scale
+
+            print(
+                "\n  Warning: skipped batch "
+                f"{batch_index} because the gradient norm was "
+                f"{float(gradient_norm)}. "
+                f"loss={float(loss.detach()):.6g}, "
+                f"t=[{float(timestep.min()):.4f}, "
+                f"{float(timestep.max()):.4f}], "
+                f"|z0|max={float(clean_latent.detach().abs().max()):.4g}, "
+                f"|zt|max={float(noisy_latent.detach().abs().max()):.4g}, "
+                f"|v_pred|max="
+                f"{float(predicted_velocity.detach().abs().max()):.4g}, "
+                f"AMP scale {old_scale:.1f} -> {new_scale:.1f}."
+            )
+
+            if (
+                consecutive_nonfinite_batches
+                >= MAX_CONSECUTIVE_NONFINITE_GRADIENTS
+            ):
+                raise FloatingPointError(
+                    "Persistent non-finite gradients: "
+                    f"{consecutive_nonfinite_batches} consecutive "
+                    "batches failed. Reduce LEARNING_RATE, disable AMP, "
+                    "and inspect the printed latent/input magnitudes."
+                )
+
+            continue
+
+        consecutive_nonfinite_batches = 0
 
         scaler.step(optimizer)
         scaler.update()
@@ -2371,6 +2452,11 @@ def train_one_epoch(
 
             print(message)
 
+    if total_samples == 0:
+        raise RuntimeError(
+            "Every training batch was skipped because of non-finite gradients."
+        )
+
     result = {
         "flow_loss": (
             flow_loss_sum / total_samples
@@ -2378,6 +2464,7 @@ def train_one_epoch(
         "latent_l1": (
             latent_l1_sum / total_samples
         ),
+        "skipped_nonfinite_batches": skipped_nonfinite_batches,
         "timestep_losses": (
             finalize_timestep_tracker(
                 timestep_tracker
@@ -3172,6 +3259,7 @@ def train_workflow(
     print(
         f"\nDevice: {device}\n"
         f"Mixed precision: {use_amp}\n"
+        f"AMP dtype: {get_amp_dtype(device) if use_amp else 'float32'}\n"
         f"Training pairs: {len(train_pairs)}\n"
         f"Validation pairs: {len(validation_pairs)}\n"
         f"Trainable parameters: "
@@ -3192,8 +3280,20 @@ def train_workflow(
         )
     )
 
+    amp_dtype = get_amp_dtype(device)
+
     scaler = GradScaler(
-        enabled=use_amp
+        enabled=(
+            use_amp
+            and amp_dtype == torch.float16
+        ),
+        init_scale=FP16_INITIAL_SCALE,
+        growth_interval=FP16_GROWTH_INTERVAL,
+    )
+
+    print(
+        f"GradScaler enabled: {scaler.is_enabled()} | "
+        f"initial scale: {float(scaler.get_scale()):.1f}"
     )
 
     start_epoch = 1
@@ -3223,11 +3323,38 @@ def train_workflow(
             ]
         )
 
-        if "scaler_state_dict" in resume_checkpoint:
+        if OVERRIDE_RESUMED_LEARNING_RATE:
+            for parameter_group in optimizer.param_groups:
+                parameter_group["lr"] = LEARNING_RATE
+                parameter_group["initial_lr"] = LEARNING_RATE
+
+            scheduler.base_lrs = [
+                LEARNING_RATE
+                for _ in optimizer.param_groups
+            ]
+            scheduler._last_lr = [
+                LEARNING_RATE
+                for _ in optimizer.param_groups
+            ]
+
+            print(
+                "Overrode resumed learning rate with "
+                f"LEARNING_RATE={LEARNING_RATE:.2e}."
+            )
+
+        if (
+            LOAD_SCALER_STATE_ON_RESUME
+            and "scaler_state_dict" in resume_checkpoint
+        ):
             scaler.load_state_dict(
                 resume_checkpoint[
                     "scaler_state_dict"
                 ]
+            )
+        elif scaler.is_enabled():
+            print(
+                "Using a fresh, lower FP16 GradScaler state "
+                "instead of the checkpoint scaler state."
             )
 
         start_epoch = int(
@@ -3300,6 +3427,8 @@ def train_workflow(
             f"\nEpoch {epoch:03d}/{NUM_EPOCHS:03d} | "
             f"LR={current_learning_rate:.2e} | "
             f"train flow={train_metrics['flow_loss']:.6f} | "
+            f"skipped overflow batches="
+            f"{train_metrics['skipped_nonfinite_batches']} | "
             f"validation flow="
             f"{validation_flow['flow_loss']:.6f}"
         )
