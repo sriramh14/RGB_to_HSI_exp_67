@@ -22,7 +22,7 @@ from torch.utils.data import DataLoader, Dataset
 # ============================================================================
 # Adjust only these import paths if your project layout is different.
 from models.HSI_VAE import HSIVAE
-from models.MMDiT_rgb2hsi import RGBConditionedHSIMMDiT
+from models.hsi_mmdit import RGBConditionedHSIMMDiT
 
 from loss.mrae import mrae
 from loss.psnr import psnr
@@ -61,6 +61,15 @@ VALIDATION_RGB_DIR = (
 # It is retained as a fallback for older MM-DiT checkpoints.
 VAE_CHECKPOINT = "./vae_checkpoints/best_vae.pth"
 OUTPUT_DIR = "./mmdit_checkpoints"
+
+# Dataset-validation caches. They are reused while the HSI file paths,
+# sizes, and modification times remain unchanged.
+TRAIN_PAIR_VALIDATION_CACHE = (
+    Path(OUTPUT_DIR) / "training_pair_validation_cache.pth"
+)
+VALIDATION_PAIR_VALIDATION_CACHE = (
+    Path(OUTPUT_DIR) / "validation_pair_validation_cache.pth"
+)
 
 # Used by RUN_MODE="infer". The best checkpoint is normally selected here.
 INFERENCE_CHECKPOINT = "./mmdit_checkpoints/best_mmdit.pth"
@@ -591,76 +600,428 @@ def pair_hsi_rgb_files(
     return pairs
 
 
-def validate_pairs(
+def make_files_fingerprint(
+    files: Sequence[Path],
+) -> str:
+    """
+    Create a cache fingerprint from file path, size, and modification time.
+
+    The cache is invalidated automatically if an HSI file is added, removed,
+    replaced, or modified.
+    """
+    records = []
+
+    for file_path in files:
+        stat = file_path.stat()
+        records.append(
+            f"{file_path.resolve()}|"
+            f"{stat.st_size}|"
+            f"{stat.st_mtime_ns}"
+        )
+
+    return hashlib.sha256(
+        "\n".join(records).encode("utf-8")
+    ).hexdigest()
+
+
+def is_possible_hsi_shape(
+    shape: Sequence[int],
+    hsi_channels: int,
+) -> bool:
+    return (
+        len(shape) == 3
+        and hsi_channels in shape
+        and all(int(size) > 0 for size in shape)
+    )
+
+
+def inspect_hdf5_mat_file(
+    file_path: Path,
+    hsi_channels: int,
+    hsi_key: str,
+) -> None:
+    """
+    Inspect a MATLAB v7.3/HDF5 file without loading its full HSI cube.
+    """
+    candidates: List[
+        Tuple[str, Tuple[int, ...]]
+    ] = []
+
+    with h5py.File(
+        str(file_path),
+        "r",
+    ) as h5_file:
+        if (
+            hsi_key in h5_file
+            and isinstance(
+                h5_file[hsi_key],
+                h5py.Dataset,
+            )
+        ):
+            dataset = h5_file[hsi_key]
+            candidates.append(
+                (
+                    hsi_key,
+                    tuple(
+                        int(value)
+                        for value in dataset.shape
+                    ),
+                )
+            )
+        else:
+            def visitor(name, obj):
+                if (
+                    not isinstance(obj, h5py.Dataset)
+                    or obj.ndim != 3
+                ):
+                    return
+
+                try:
+                    if np.issubdtype(
+                        obj.dtype,
+                        np.number,
+                    ):
+                        candidates.append(
+                            (
+                                name,
+                                tuple(
+                                    int(value)
+                                    for value in obj.shape
+                                ),
+                            )
+                        )
+                except TypeError:
+                    return
+
+            h5_file.visititems(visitor)
+
+    if not candidates:
+        raise ValueError(
+            f"No numerical three-dimensional dataset "
+            f"was found in {file_path}."
+        )
+
+    if not any(
+        is_possible_hsi_shape(
+            shape,
+            hsi_channels,
+        )
+        for _, shape in candidates
+    ):
+        raise ValueError(
+            f"No {hsi_channels}-band cube was found in "
+            f"{file_path}. HDF5 datasets: {candidates}"
+        )
+
+
+def inspect_standard_mat_file(
+    file_path: Path,
+    hsi_channels: int,
+    hsi_key: str,
+) -> None:
+    """
+    Inspect a standard MATLAB file using scipy.io.whosmat(), which reads
+    array metadata rather than loading every array.
+    """
+    try:
+        metadata = sio.whosmat(file_path)
+    except (
+        NotImplementedError,
+        ValueError,
+        OSError,
+    ):
+        # MATLAB v7.3 files require HDF5 inspection.
+        inspect_hdf5_mat_file(
+            file_path=file_path,
+            hsi_channels=hsi_channels,
+            hsi_key=hsi_key,
+        )
+        return
+
+    candidates = [
+        (
+            name,
+            tuple(
+                int(value)
+                for value in shape
+            ),
+        )
+        for name, shape, _ in metadata
+        if len(shape) == 3
+    ]
+
+    if not candidates:
+        raise ValueError(
+            f"No three-dimensional array was found in "
+            f"{file_path}."
+        )
+
+    preferred = [
+        candidate
+        for candidate in candidates
+        if candidate[0] == hsi_key
+    ]
+    arrays_to_check = (
+        preferred
+        if preferred
+        else candidates
+    )
+
+    if not any(
+        is_possible_hsi_shape(
+            shape,
+            hsi_channels,
+        )
+        for _, shape in arrays_to_check
+    ):
+        raise ValueError(
+            f"No {hsi_channels}-band cube was found in "
+            f"{file_path}. MATLAB arrays: {candidates}"
+        )
+
+
+def inspect_hsi_file_metadata(
+    file_path: Path,
+    hsi_channels: int,
+    hsi_key: str,
+) -> None:
+    """
+    Validate an HSI file in the same way as the earlier training script.
+
+    .mat:
+        Inspect metadata only with whosmat() or an HDF5 header.
+
+    .npy/.npz/.pt/.pth:
+        Reuse the normal loader because these formats are comparatively
+        inexpensive to inspect.
+    """
+    if file_path.suffix.lower() == ".mat":
+        inspect_standard_mat_file(
+            file_path=file_path,
+            hsi_channels=hsi_channels,
+            hsi_key=hsi_key,
+        )
+        return
+
+    cube = load_hsi_file(file_path)
+
+    if not is_possible_hsi_shape(
+        cube.shape,
+        hsi_channels,
+    ):
+        raise ValueError(
+            f"Invalid HSI shape {cube.shape} in "
+            f"{file_path}."
+        )
+
+
+def filter_valid_pairs(
     pairs: Sequence[Tuple[Path, Path]],
     hsi_channels: int,
     log_path: Path,
+    cache_path: Path,
 ) -> List[Tuple[Path, Path]]:
-    valid_pairs: List[Tuple[Path, Path]] = []
-    invalid_records: List[str] = []
+    """
+    Metadata-first HSI validation with a persistent cache.
 
-    print("\nChecking HSI/RGB pairs...")
+    This mirrors the checking approach in the earlier script:
+      1. Pair files by filename stem.
+      2. Check MATLAB files through metadata rather than loading full cubes.
+      3. Cache valid/invalid results using a file fingerprint.
+      4. Skip invalid HSI files and write their errors to a log.
 
-    for index, (hsi_path, rgb_path) in enumerate(
+    RGB files have already been checked for a supported extension during
+    pairing. Their full pixel data is loaded only by the Dataset.
+    """
+    cache_path.parent.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+    log_path.parent.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+
+    pairs = list(pairs)
+    hsi_files = [
+        hsi_path
+        for hsi_path, _ in pairs
+    ]
+
+    fingerprint = make_files_fingerprint(
+        hsi_files
+    )
+
+    pair_lookup = {
+        str(hsi_path.resolve()): (
+            hsi_path,
+            rgb_path,
+        )
+        for hsi_path, rgb_path in pairs
+    }
+
+    # ------------------------------------------------------------------
+    # Reuse an unchanged validation cache.
+    # ------------------------------------------------------------------
+    if cache_path.exists():
+        try:
+            try:
+                cached = torch.load(
+                    cache_path,
+                    map_location="cpu",
+                    weights_only=False,
+                )
+            except TypeError:
+                cached = torch.load(
+                    cache_path,
+                    map_location="cpu",
+                )
+
+            if (
+                isinstance(cached, dict)
+                and cached.get("fingerprint")
+                == fingerprint
+            ):
+                valid_paths = cached.get(
+                    "valid_hsi_paths",
+                    [],
+                )
+                invalid_records = cached.get(
+                    "invalid_records",
+                    [],
+                )
+
+                valid_pairs = [
+                    pair_lookup[path]
+                    for path in valid_paths
+                    if path in pair_lookup
+                ]
+
+                print(
+                    f"\nUsing cached pair validation: "
+                    f"{cache_path}"
+                )
+                print(
+                    f"Valid pairs:   {len(valid_pairs)}"
+                )
+                print(
+                    f"Invalid files: "
+                    f"{len(invalid_records)}"
+                )
+
+                for record in invalid_records:
+                    print(
+                        "\nCached invalid file:\n"
+                        f"  File:  {record['path']}\n"
+                        f"  Error: {record['error']}"
+                    )
+
+                if valid_pairs:
+                    return valid_pairs
+
+        except Exception as error:
+            print(
+                "\nCould not use the validation cache. "
+                "The dataset will be checked again.\n"
+                f"Reason: {error}"
+            )
+
+    # ------------------------------------------------------------------
+    # Perform a fresh metadata-first scan.
+    # ------------------------------------------------------------------
+    print(
+        "\nChecking HSI file metadata before use..."
+    )
+
+    valid_pairs: List[
+        Tuple[Path, Path]
+    ] = []
+    invalid_records: List[dict] = []
+
+    for index, (
+        hsi_path,
+        rgb_path,
+    ) in enumerate(
         pairs,
         start=1,
     ):
         try:
-            hsi_cube = convert_hsi_to_chw(
-                load_hsi_file(hsi_path),
-                hsi_channels=hsi_channels,
+            inspect_hsi_file_metadata(
                 file_path=hsi_path,
+                hsi_channels=hsi_channels,
+                hsi_key=HSI_KEY,
             )
-            rgb_array = load_rgb_file(rgb_path)
-
-            if not np.isfinite(hsi_cube).all():
-                raise ValueError(
-                    "HSI contains NaN or Inf values."
-                )
-            if not np.isfinite(rgb_array).all():
-                raise ValueError(
-                    "RGB contains NaN or Inf values."
-                )
-
-            if hsi_cube.shape[1:] != rgb_array.shape[1:]:
-                raise ValueError(
-                    "Spatial dimensions do not match: "
-                    f"HSI={hsi_cube.shape[1:]}, "
-                    f"RGB={rgb_array.shape[1:]}."
-                )
-
-            valid_pairs.append((hsi_path, rgb_path))
+            valid_pairs.append(
+                (hsi_path, rgb_path)
+            )
 
         except Exception as error:
             invalid_records.append(
-                f"{hsi_path} | {rgb_path} | "
-                f"{type(error).__name__}: {error}"
+                {
+                    "path": str(
+                        hsi_path.resolve()
+                    ),
+                    "error": (
+                        f"{type(error).__name__}: "
+                        f"{error}"
+                    ),
+                }
             )
 
-        if index % 100 == 0 or index == len(pairs):
+            print(
+                "\nSkipping invalid HSI file:\n"
+                f"  File:  {hsi_path}\n"
+                f"  Error: {error}"
+            )
+
+        if (
+            index % 100 == 0
+            or index == len(pairs)
+        ):
             print(
                 f"Checked {index}/{len(pairs)} | "
-                f"valid={len(valid_pairs)} | "
-                f"invalid={len(invalid_records)}"
+                f"Valid: {len(valid_pairs)} | "
+                f"Invalid: {len(invalid_records)}"
             )
-
-    if invalid_records:
-        log_path.parent.mkdir(
-            parents=True,
-            exist_ok=True,
-        )
-        log_path.write_text(
-            "\n".join(invalid_records),
-            encoding="utf-8",
-        )
-        print(
-            f"Invalid-pair log saved to: {log_path}"
-        )
 
     if not valid_pairs:
         raise RuntimeError(
-            "No valid HSI/RGB pairs remain."
+            "No valid HSI/RGB pairs remain after "
+            "metadata validation."
         )
+
+    if invalid_records:
+        with log_path.open(
+            "w",
+            encoding="utf-8",
+        ) as log_file:
+            for record in invalid_records:
+                log_file.write(
+                    f"{record['path']} | "
+                    f"{record['error']}\n"
+                )
+
+        print(
+            f"\nInvalid-file log saved to: "
+            f"{log_path}"
+        )
+
+    torch.save(
+        {
+            "fingerprint": fingerprint,
+            "valid_hsi_paths": [
+                str(hsi_path.resolve())
+                for hsi_path, _ in valid_pairs
+            ],
+            "invalid_records": invalid_records,
+        },
+        cache_path,
+    )
+
+    print(
+        f"Validation cache saved to: "
+        f"{cache_path}"
+    )
 
     return valid_pairs
 
@@ -2644,21 +3005,23 @@ def prepare_pairs(
         rgb_directory=VALIDATION_RGB_DIR,
     )
 
-    train_pairs = validate_pairs(
+    train_pairs = filter_valid_pairs(
         pairs=train_pairs,
         hsi_channels=HSI_CHANNELS,
         log_path=(
             output_directory
             / "invalid_training_pairs.txt"
         ),
+        cache_path=TRAIN_PAIR_VALIDATION_CACHE,
     )
-    validation_pairs = validate_pairs(
+    validation_pairs = filter_valid_pairs(
         pairs=validation_pairs,
         hsi_channels=HSI_CHANNELS,
         log_path=(
             output_directory
             / "invalid_validation_pairs.txt"
         ),
+        cache_path=VALIDATION_PAIR_VALIDATION_CACHE,
     )
 
     return train_pairs, validation_pairs
@@ -3171,13 +3534,14 @@ def main() -> None:
             hsi_directory=VALIDATION_HSI_DIR,
             rgb_directory=VALIDATION_RGB_DIR,
         )
-        validation_pairs = validate_pairs(
+        validation_pairs = filter_valid_pairs(
             pairs=validation_pairs,
             hsi_channels=HSI_CHANNELS,
             log_path=(
                 output_directory
                 / "invalid_validation_pairs.txt"
             ),
+            cache_path=VALIDATION_PAIR_VALIDATION_CACHE,
         )
 
         model = load_model_for_inference(
