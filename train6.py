@@ -47,7 +47,7 @@ from torch.utils.data import DataLoader, Dataset
 # -----------------------------------------------------------------------------
 # Adjust only these imports if you place the files somewhere else.
 
-from models.diffusion_DiT import HSILatentDiffusionUNet
+from models.Unet_hsi import HSILatentDiffusionUNet
 
 from models.HSI_VAE import HSIVAE
 
