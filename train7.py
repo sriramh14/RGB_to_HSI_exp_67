@@ -57,9 +57,16 @@ from models.Unet_hsi import HSILatentDiffusionUNet
 from models.HSI_VAE import HSIVAE
 from models.MST_Plus_Plus import MST_Plus_Plus
 
-# Project metric import. MRAE is defined in its own file, matching the
-# convention metric(target, prediction) used elsewhere in the project.
+# Project metric imports. Each metric is defined in its own file, matching
+# the convention metric(target, prediction) used elsewhere in the project.
+# MRAE is used for both the diffusion-target training/validation metric and
+# visualization; RMSE, PSNR, SAM, and SSIM are used only for visualization
+# (computed against the final reconstructed HSI, not the diffusion target).
 from loss.mrae import mrae
+from loss.psnr import psnr
+from loss.rmse import rmse
+from loss.sam import sam
+from loss.ssim import ssim
 
 # =============================================================================
 # Configuration: edit values here; argparse is used only for --mode
@@ -115,7 +122,7 @@ VALIDATION_PAIR_VALIDATION_CACHE = OUTPUT_DIR / "validation_pair_validation_cach
 # DiffBIR / IRControlNet settings (see model.py: IRControlNet, DiffBIRHSI).
 # LATENT_CHANNELS / SKIP_CHANNELS / MID_CHANNELS must match the architecture
 # of the pretrained HSI latent diffusion UNet loaded from UNET_CHECKPOINT.
-LATENT_CHANNELS = 16
+LATENT_CHANNELS = 4
 SKIP_CHANNELS: Sequence[int] = (128, 128, 128, 256, 256, 256, 512, 512, 512, 512, 512, 512)
 MID_CHANNELS = 512
 NUM_TRAIN_TIMESTEPS = 1000
@@ -870,20 +877,82 @@ def strip_prefix_if_present(
     return state_dict
 
 
+def _tensor_entry_fraction(mapping: dict) -> float:
+    """Fraction of a mapping's values that are tensors (0.0 for an empty mapping)."""
+    if not mapping:
+        return 0.0
+    tensor_count = sum(1 for value in mapping.values() if torch.is_tensor(value))
+    return tensor_count / len(mapping)
+
+
+def _filter_tensor_entries(mapping: dict) -> Dict[str, torch.Tensor]:
+    """Keep only tensor-valued entries, dropping non-tensor metadata (e.g. an
+    'epoch' int or 'config' dict that may be interleaved with the weights)."""
+    return {key: value for key, value in mapping.items() if torch.is_tensor(value)}
+
+
 def extract_state_dict(
     checkpoint: object,
     candidate_keys: Sequence[str],
+    tensor_fraction_threshold: float = 0.9,
 ) -> Dict[str, torch.Tensor]:
+    """
+    Extract a state_dict from an arbitrary checkpoint object, tolerating a
+    wide range of formats produced by different training setups. Resolution
+    order:
+
+      1. If `checkpoint` is already an `nn.Module` (a full model object was
+         saved rather than a state_dict), use its own `.state_dict()`.
+      2. If `checkpoint` is a dict, look for a nested tensor-mapping under
+         any of `candidate_keys` (allowing that nested value to itself be an
+         `nn.Module`).
+      3. If `checkpoint` itself is mostly tensor-valued (>= threshold), treat
+         it as a raw state_dict, dropping any non-tensor metadata entries
+         mixed in alongside the weights (e.g. 'epoch', 'config').
+      4. Otherwise, search every dict-valued entry in `checkpoint` and return
+         the largest one that is mostly tensor-valued (handles checkpoints
+         saved under unanticipated keys such as 'net', 'ema', 'generator').
+
+    Raises KeyError only if none of the above yields a usable state_dict.
+    """
+    if isinstance(checkpoint, nn.Module):
+        return checkpoint.state_dict()
+
     if isinstance(checkpoint, dict):
         for key in candidate_keys:
             value = checkpoint.get(key)
-            if isinstance(value, dict) and value and all(
-                torch.is_tensor(tensor) for tensor in value.values()
-            ):
-                return value
-        if checkpoint and all(torch.is_tensor(value) for value in checkpoint.values()):
-            return checkpoint  # raw state_dict
-    raise KeyError(f"Could not find a state_dict using keys: {tuple(candidate_keys)}")
+            if isinstance(value, nn.Module):
+                return value.state_dict()
+            if isinstance(value, dict) and _tensor_entry_fraction(value) >= tensor_fraction_threshold:
+                return _filter_tensor_entries(value)
+
+        if _tensor_entry_fraction(checkpoint) >= tensor_fraction_threshold:
+            return _filter_tensor_entries(checkpoint)
+
+        best_candidate: Optional[Dict[str, torch.Tensor]] = None
+        best_size = -1
+        for value in checkpoint.values():
+            if isinstance(value, nn.Module):
+                state_dict = value.state_dict()
+                if len(state_dict) > best_size:
+                    best_candidate, best_size = state_dict, len(state_dict)
+                continue
+            if isinstance(value, dict) and _tensor_entry_fraction(value) >= tensor_fraction_threshold:
+                filtered = _filter_tensor_entries(value)
+                if len(filtered) > best_size:
+                    best_candidate, best_size = filtered, len(filtered)
+        if best_candidate is not None:
+            return best_candidate
+
+    raise KeyError(
+        f"Could not find a state_dict using keys: {tuple(candidate_keys)}. "
+        f"Checkpoint top-level type: {type(checkpoint)}"
+        + (
+            f", keys: {list(checkpoint.keys())}"
+            if isinstance(checkpoint, dict)
+            else ""
+        )
+    )
 
 
 def load_frozen_component_weights(
@@ -1177,7 +1246,7 @@ def _metric_to_float(value: Any, name: str) -> float:
         value = value.mean()
 
     result = float(value.item())
-    if not np.isfinite(result):
+    if not np.isfinite(result) and not (name == "PSNR" and result == float("inf")):
         raise FloatingPointError(f"{name} returned a non-finite value: {result}")
     return result
 
@@ -1535,14 +1604,35 @@ def hsi_triplet_to_display(
 def calculate_display_metrics(
     prediction: torch.Tensor,
     target: torch.Tensor,
-) -> Tuple[float, float]:
+) -> Dict[str, float]:
+    """
+    Full reconstruction-quality metric suite (MRAE, PSNR, RMSE, SAM, SSIM)
+    for one HSI cube, computed with the same project metric functions used
+    for validation reporting. Unlike ``calculate_noise_mrae``, this compares
+    the final reconstructed HSI against the ground-truth HSI cube (used only
+    for the visualization panel captions, not for the diffusion training
+    objective).
+    """
     prediction = prediction.detach().float()
     target = target.detach().float()
-    mrae_value = torch.mean(torch.abs(prediction - target) / (torch.abs(target) + 1e-6))
-    mse = torch.mean((prediction - target) ** 2)
-    data_range = float((target.max() - target.min()).clamp_min(1e-8))
-    psnr = 20.0 * np.log10(data_range) - 10.0 * np.log10(max(float(mse), 1e-12))
-    return float(mrae_value), float(psnr)
+
+    if not torch.isfinite(prediction).all():
+        raise FloatingPointError("Visualization prediction contains NaN or Inf.")
+    if not torch.isfinite(target).all():
+        raise FloatingPointError("Visualization target contains NaN or Inf.")
+
+    # Metric functions follow the convention metric(target, prediction) and
+    # expect a batch dimension, matching their use elsewhere in the project.
+    batched_prediction = prediction.unsqueeze(0)
+    batched_target = target.unsqueeze(0)
+
+    return {
+        "mrae": _metric_to_float(mrae(batched_target, batched_prediction), "MRAE"),
+        "psnr": _metric_to_float(psnr(batched_target, batched_prediction), "PSNR"),
+        "rmse": _metric_to_float(rmse(batched_target, batched_prediction), "RMSE"),
+        "sam": _metric_to_float(sam(batched_target, batched_prediction), "SAM"),
+        "ssim": _metric_to_float(ssim(batched_target, batched_prediction), "SSIM"),
+    }
 
 
 @torch.no_grad()
@@ -1619,8 +1709,8 @@ def run_visualization(
             bands=VISUALIZATION_BANDS,
         )
 
-        stage1_mrae, stage1_psnr = calculate_display_metrics(stage1_prediction, target)
-        refined_mrae, refined_psnr = calculate_display_metrics(refined_prediction, target)
+        stage1_metrics = calculate_display_metrics(stage1_prediction, target)
+        refined_metrics = calculate_display_metrics(refined_prediction, target)
         stem = Path(hsi_path_string).stem
 
         panels = (rgb_display, target_display, stage1_display, refined_display)
@@ -1633,11 +1723,15 @@ def run_visualization(
 
         axes[row, 0].set_ylabel(
             f"{stem}\n"
-            f"MST++: MRAE {stage1_mrae:.4f}, PSNR {stage1_psnr:.2f} dB\n"
-            f"DiffBIR: MRAE {refined_mrae:.4f}, PSNR {refined_psnr:.2f} dB",
-            fontsize=9,
+            f"MST++: MRAE {stage1_metrics['mrae']:.4f}, PSNR {stage1_metrics['psnr']:.2f} dB, "
+            f"RMSE {stage1_metrics['rmse']:.4f}, SAM {stage1_metrics['sam']:.4f}, "
+            f"SSIM {stage1_metrics['ssim']:.4f}\n"
+            f"DiffBIR: MRAE {refined_metrics['mrae']:.4f}, PSNR {refined_metrics['psnr']:.2f} dB, "
+            f"RMSE {refined_metrics['rmse']:.4f}, SAM {refined_metrics['sam']:.4f}, "
+            f"SSIM {refined_metrics['ssim']:.4f}",
+            fontsize=8,
             rotation=0,
-            labelpad=105,
+            labelpad=115,
             va="center",
         )
 
