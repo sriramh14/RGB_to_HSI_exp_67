@@ -1,4 +1,3 @@
-
 """Train and visualize a DiffBIR-style HSI refinement model on paired RGB/HSI data.
 
 The trainable model is imported from ``model`` (see ``model.py``). Its frozen
@@ -29,7 +28,6 @@ from __future__ import annotations
 
 import argparse
 import hashlib
-import math
 import random
 from contextlib import nullcontext
 from pathlib import Path
@@ -42,8 +40,6 @@ import scipy.io as sio
 import torch
 import torch.nn.functional as F
 from PIL import Image
-from skimage.metrics import peak_signal_noise_ratio as sk_peak_signal_noise_ratio
-from skimage.metrics import structural_similarity as sk_structural_similarity
 from torch import nn
 from torch.cuda.amp import GradScaler
 from torch.utils.data import DataLoader, Dataset
@@ -56,13 +52,18 @@ from torch.utils.data import DataLoader, Dataset
 # wrapper, HSI VAE, HSI latent diffusion UNet, IRControlNet, the generation
 # module, the diffusion scheduler, and the region-adaptive restoration
 # guidance) are imported from there -- none are redefined here.
-from models.DiffBIR import DiffBIRHSI
-from models.Unet_hsi import HSILatentDiffusionUNet
-from models.HSI_VAE import HSIVAE
-from models.MST_Plus_Plus import MST_Plus_Plus
-# Project metric import. MRAE is defined in its own file, matching the
-# convention metric(target, prediction) used elsewhere in the project.
+from models.DiffBIR import DiffBIRHSI, HSILatentDiffusionUNet, HSIVAE, MST_Plus_Plus
+
+# Project metric imports. Each metric is defined in its own file, matching
+# the convention metric(target, prediction) used elsewhere in the project.
+# MRAE is used for both the diffusion-target training/validation metric and
+# visualization; RMSE, PSNR, SAM, and SSIM are used only for visualization
+# (computed against the final reconstructed HSI, not the diffusion target).
 from loss.mrae import mrae
+from loss.psnr import psnr
+from loss.rmse import rmse
+from loss.sam import sam
+from loss.ssim import ssim
 
 # =============================================================================
 # Configuration: edit values here; argparse is used only for --mode
@@ -98,16 +99,37 @@ VISUALIZATION_CHECKPOINT = BEST_CHECKPOINT
 VISUALIZATION_DIR = Path("./diffbir_hsi_visualizations")
 VISUALIZATION_FILE = VISUALIZATION_DIR / "random_validation_visualization.png"
 
-# Arguments passed to each component's constructor.
+# Shared latent-space width. Must match between the VAE and the latent
+# diffusion UNet, since the UNet operates directly on VAE latents.
+LATENT_CHANNELS = 16
+
+HSI_KEY = "cube"
+HSI_CHANNELS = 31
+
+# Arguments passed to each component's constructor. These mirror the
+# concrete HSIVAE / HSILatentDiffusionUNet architectures used in this
+# project (see hsi_vae.py / hsi_diffusion_unet.py) -- adjust to match
+# whatever configuration your pretrained checkpoints were trained with.
 MST_MODEL_KWARGS: Dict[str, Any] = {}
-VAE_MODEL_KWARGS: Dict[str, Any] = {}
-UNET_MODEL_KWARGS: Dict[str, Any] = {}
+VAE_MODEL_KWARGS: Dict[str, Any] = dict(
+    hsi_channels=HSI_CHANNELS,
+    base_channels=64,
+    latent_channels=LATENT_CHANNELS,
+    num_res_blocks=2,
+)
+UNET_MODEL_KWARGS: Dict[str, Any] = dict(
+    latent_channels=LATENT_CHANNELS,
+    base_channels=64,
+    channel_multipliers=(1, 2, 4, 4),
+    num_res_blocks=2,
+    attention_levels=(2, 3),
+    num_heads=8,
+    dropout=0.0,
+)
 STRICT_MST_CHECKPOINT = True
 STRICT_VAE_CHECKPOINT = True
 STRICT_UNET_CHECKPOINT = True
 
-HSI_KEY = "cube"
-HSI_CHANNELS = 31
 SUPPORTED_HSI_EXTENSIONS = {".npy", ".npz", ".mat", ".pt", ".pth"}
 SUPPORTED_RGB_EXTENSIONS = {".png", ".jpg", ".jpeg", ".npy", ".pt", ".pth"}
 HSI_NORMALIZATION = "none"  # "none", "minmax", or "band_minmax"
@@ -116,30 +138,26 @@ TRAIN_PAIR_VALIDATION_CACHE = OUTPUT_DIR / "training_pair_validation_cache.pth"
 VALIDATION_PAIR_VALIDATION_CACHE = OUTPUT_DIR / "validation_pair_validation_cache.pth"
 
 # DiffBIR / IRControlNet settings (see model.py: IRControlNet, DiffBIRHSI).
-# LATENT_CHANNELS / SKIP_CHANNELS / MID_CHANNELS must match the architecture
-# of the pretrained HSI latent diffusion UNet loaded from UNET_CHECKPOINT.
-LATENT_CHANNELS = 16
-SKIP_CHANNELS: Sequence[int] = (128, 128, 128, 256, 256, 256, 512, 512, 512, 512, 512, 512)
-MID_CHANNELS = 512
+# Per-stage skip-connection channel counts and the middle-block channel
+# count are derived automatically inside DiffBIRHSI from the UNet's own
+# `base_channels`/`channel_multipliers` attributes, so they do not need to
+# be configured here.
 NUM_TRAIN_TIMESTEPS = 1000
 GUIDANCE_PATCH_SIZE = 8
-
-# DiffBIR uses an empty positive text prompt (and a fixed negative prompt at
-# inference time) as cross-attention context. The HSI adaptation has no text
-# encoder, so no cross-attention context is supplied by default. If your
-# HSILatentDiffusionUNet requires a non-None context tensor, replace this
-# constant with the appropriate fixed embedding.
-CONTEXT: Optional[torch.Tensor] = None
 
 # Dataset and training settings.
 TRAIN_CROP_SIZE = 256
 PATCHES_PER_IMAGE = 2
 USE_AUGMENTATION = True
-MODEL_DOWNSAMPLE_FACTOR = 8
+# HSIVAE downsamples spatial resolution by 4x (two stride-2 downsamples in
+# HSIEncoder), and HSIDecoder upsamples by a fixed 4x in turn (two
+# nearest-neighbor x2 upsamples with no shape-matching), so crop/pad sizes
+# must be exact multiples of 4 for a correct encode/decode round trip.
+MODEL_DOWNSAMPLE_FACTOR = 4
 
 BATCH_SIZE = 2
 VALIDATION_BATCH_SIZE = 2
-NUM_EPOCHS = 10
+NUM_EPOCHS = 30
 LEARNING_RATE = 5e-5
 WEIGHT_DECAY = 1e-4
 MIN_LEARNING_RATE = 1e-7
@@ -873,57 +891,81 @@ def strip_prefix_if_present(
     return state_dict
 
 
+def _tensor_entry_fraction(mapping: dict) -> float:
+    """Fraction of a mapping's values that are tensors (0.0 for an empty mapping)."""
+    if not mapping:
+        return 0.0
+    tensor_count = sum(1 for value in mapping.values() if torch.is_tensor(value))
+    return tensor_count / len(mapping)
+
+
+def _filter_tensor_entries(mapping: dict) -> Dict[str, torch.Tensor]:
+    """Keep only tensor-valued entries, dropping non-tensor metadata (e.g. an
+    'epoch' int or 'config' dict that may be interleaved with the weights)."""
+    return {key: value for key, value in mapping.items() if torch.is_tensor(value)}
+
+
 def extract_state_dict(
     checkpoint: object,
     candidate_keys: Sequence[str],
+    tensor_fraction_threshold: float = 0.9,
 ) -> Dict[str, torch.Tensor]:
+    """
+    Extract a state_dict from an arbitrary checkpoint object, tolerating a
+    wide range of formats produced by different training setups. Resolution
+    order:
+
+      1. If `checkpoint` is already an `nn.Module` (a full model object was
+         saved rather than a state_dict), use its own `.state_dict()`.
+      2. If `checkpoint` is a dict, look for a nested tensor-mapping under
+         any of `candidate_keys` (allowing that nested value to itself be an
+         `nn.Module`).
+      3. If `checkpoint` itself is mostly tensor-valued (>= threshold), treat
+         it as a raw state_dict, dropping any non-tensor metadata entries
+         mixed in alongside the weights (e.g. 'epoch', 'config').
+      4. Otherwise, search every dict-valued entry in `checkpoint` and return
+         the largest one that is mostly tensor-valued (handles checkpoints
+         saved under unanticipated keys such as 'net', 'ema', 'generator').
+
+    Raises KeyError only if none of the above yields a usable state_dict.
+    """
+    if isinstance(checkpoint, nn.Module):
+        return checkpoint.state_dict()
+
     if isinstance(checkpoint, dict):
         for key in candidate_keys:
             value = checkpoint.get(key)
-            if isinstance(value, dict) and value and all(
-                torch.is_tensor(tensor) for tensor in value.values()
-            ):
-                return value
-        if checkpoint and all(torch.is_tensor(value) for value in checkpoint.values()):
-            return checkpoint  # raw state_dict
+            if isinstance(value, nn.Module):
+                return value.state_dict()
+            if isinstance(value, dict) and _tensor_entry_fraction(value) >= tensor_fraction_threshold:
+                return _filter_tensor_entries(value)
 
-        # None of the expected key names matched. Rather than giving up
-        # immediately, look for any nested dict whose values are all
-        # tensors -- that is almost certainly the state_dict, just saved
-        # under a key name this script doesn't already know about.
-        nested_candidates = [
-            (key, value)
-            for key, value in checkpoint.items()
-            if isinstance(value, dict) and value and all(torch.is_tensor(v) for v in value.values())
-        ]
-        if len(nested_candidates) == 1:
-            found_key, state_dict = nested_candidates[0]
-            print(
-                f"Note: '{found_key}' is not in candidate_keys={tuple(candidate_keys)}, "
-                f"but it is the only nested tensor dict in the checkpoint, so it is "
-                f"being used as the state_dict. Consider adding '{found_key}' to the "
-                f"relevant candidate_keys tuple in build_model()."
-            )
-            return state_dict
-        if len(nested_candidates) > 1:
-            ambiguous_keys = [key for key, _ in nested_candidates]
-            raise KeyError(
-                f"Could not find a state_dict using keys: {tuple(candidate_keys)}. "
-                f"Multiple nested tensor dicts were found under keys {ambiguous_keys}; "
-                f"add the correct one to the candidate_keys tuple in build_model()."
-            )
+        if _tensor_entry_fraction(checkpoint) >= tensor_fraction_threshold:
+            return _filter_tensor_entries(checkpoint)
 
-        available_keys = list(checkpoint.keys())
-        raise KeyError(
-            f"Could not find a state_dict using keys: {tuple(candidate_keys)}. "
-            f"Top-level keys found in the checkpoint instead: {available_keys}. "
-            f"Add whichever of these holds the weights to the relevant "
-            f"candidate_keys tuple in build_model()."
-        )
+        best_candidate: Optional[Dict[str, torch.Tensor]] = None
+        best_size = -1
+        for value in checkpoint.values():
+            if isinstance(value, nn.Module):
+                state_dict = value.state_dict()
+                if len(state_dict) > best_size:
+                    best_candidate, best_size = state_dict, len(state_dict)
+                continue
+            if isinstance(value, dict) and _tensor_entry_fraction(value) >= tensor_fraction_threshold:
+                filtered = _filter_tensor_entries(value)
+                if len(filtered) > best_size:
+                    best_candidate, best_size = filtered, len(filtered)
+        if best_candidate is not None:
+            return best_candidate
 
     raise KeyError(
         f"Could not find a state_dict using keys: {tuple(candidate_keys)}. "
-        f"The loaded checkpoint object is of type {type(checkpoint).__name__}, not a dict."
+        f"Checkpoint top-level type: {type(checkpoint)}"
+        + (
+            f", keys: {list(checkpoint.keys())}"
+            if isinstance(checkpoint, dict)
+            else ""
+        )
     )
 
 
@@ -1000,9 +1042,6 @@ def build_model(device: torch.device) -> DiffBIRHSI:
         stage1_rm=mst_model,
         vae=vae_model,
         unet=unet_model,
-        latent_channels=LATENT_CHANNELS,
-        skip_channels=SKIP_CHANNELS,
-        mid_channels=MID_CHANNELS,
         num_train_timesteps=NUM_TRAIN_TIMESTEPS,
         patch_size=GUIDANCE_PATCH_SIZE,
     )
@@ -1049,8 +1088,8 @@ def model_config_dict() -> dict:
     return {
         "hsi_channels": HSI_CHANNELS,
         "latent_channels": LATENT_CHANNELS,
-        "skip_channels": list(SKIP_CHANNELS),
-        "mid_channels": MID_CHANNELS,
+        "vae_model_kwargs": dict(VAE_MODEL_KWARGS),
+        "unet_model_kwargs": dict(UNET_MODEL_KWARGS),
         "num_train_timesteps": NUM_TRAIN_TIMESTEPS,
         "guidance_patch_size": GUIDANCE_PATCH_SIZE,
     }
@@ -1152,7 +1191,6 @@ def diffusion_forward(
     timesteps: Optional[torch.Tensor] = None,
     noise: Optional[torch.Tensor] = None,
     noise_generator: Optional[torch.Generator] = None,
-    context: Optional[torch.Tensor] = None,
 ) -> Dict[str, torch.Tensor]:
     """
     Run one forward pass of the DiffBIR-HSI training objective (Eq. 4 of the
@@ -1169,6 +1207,10 @@ def diffusion_forward(
     mode, not a stochastic sample) so that the only source of randomness in
     the objective is the diffusion timestep and noise -- keeping training and
     validation losses directly comparable, as required.
+
+    Note: HSILatentDiffusionUNet has no cross-attention/context input (its
+    forward signature is `unet(noisy_latent, timesteps)`), so no `context`
+    argument is threaded through here.
 
     Returns a dict with:
         loss:      scalar diffusion (noise-prediction) MSE loss.
@@ -1191,7 +1233,7 @@ def diffusion_forward(
             noise = torch.randn_like(z0)
 
     z_t = model.scheduler.q_sample(z0, timesteps, noise)
-    eps_pred = model.generation(z_t, timesteps, c_rm, context=context)
+    eps_pred = model.generation(z_t, timesteps, c_rm)
     loss = F.mse_loss(eps_pred, noise)
 
     return {
@@ -1218,7 +1260,7 @@ def _metric_to_float(value: Any, name: str) -> float:
         value = value.mean()
 
     result = float(value.item())
-    if not np.isfinite(result):
+    if not np.isfinite(result) and not (name == "PSNR" and result == float("inf")):
         raise FloatingPointError(f"{name} returned a non-finite value: {result}")
     return result
 
@@ -1274,7 +1316,7 @@ def train_one_epoch(
         optimizer.zero_grad(set_to_none=True)
 
         with autocast_context(device, use_amp):
-            outputs = diffusion_forward(model, rgb, hsi, context=CONTEXT)
+            outputs = diffusion_forward(model, rgb, hsi)
             loss = outputs["loss"]
 
         if not torch.isfinite(loss):
@@ -1352,7 +1394,6 @@ def validate_one_epoch(
                 hsi,
                 timesteps=timesteps,
                 noise_generator=generator,
-                context=CONTEXT,
             )
 
         sums["loss"] += float(outputs["loss"].detach()) * batch_size
@@ -1573,85 +1614,37 @@ def hsi_triplet_to_display(
     )
 
 
-def calculate_spectral_angle_mapper(
-    prediction: torch.Tensor,
-    target: torch.Tensor,
-) -> float:
-    """
-    Spectral Angle Mapper (SAM), in degrees, averaged over all pixels.
-
-    Standard hyperspectral fidelity metric: at every pixel, treats the
-    predicted and ground-truth spectra as vectors in band-space and
-    measures the angle between them (0 degrees = perfectly aligned
-    spectral shape, regardless of magnitude).
-
-    Args:
-        prediction: (C, H, W) predicted HSI cube.
-        target:     (C, H, W) ground-truth HSI cube.
-    """
-    pred_flat = prediction.reshape(prediction.shape[0], -1)      # (C, H*W)
-    target_flat = target.reshape(target.shape[0], -1)            # (C, H*W)
-
-    numerator = torch.sum(pred_flat * target_flat, dim=0)
-    pred_norm = torch.linalg.norm(pred_flat, dim=0)
-    target_norm = torch.linalg.norm(target_flat, dim=0)
-
-    cosine = numerator / (pred_norm * target_norm + 1e-8)
-    cosine = torch.clamp(cosine, min=-1.0, max=1.0)
-    sam_radians = torch.acos(cosine)
-    return float(torch.mean(sam_radians) * (180.0 / math.pi))
-
-
 def calculate_display_metrics(
     prediction: torch.Tensor,
     target: torch.Tensor,
 ) -> Dict[str, float]:
     """
-    Compute the per-image fidelity metrics shown under each panel in
-    ``run_visualization``: RMSE, MRAE, PSNR, SAM, and SSIM between a
-    predicted HSI cube and the ground-truth HSI cube.
-
-    PSNR and SSIM are computed with scikit-image (``skimage.metrics``)
-    rather than by hand. SSIM operates on 2-D images, so it is computed
-    band-by-band and averaged across the spectral dimension, which is the
-    standard way to extend SSIM to hyperspectral cubes.
-
-    Args:
-        prediction: (C, H, W) predicted HSI cube.
-        target:     (C, H, W) ground-truth HSI cube.
-
-    Returns:
-        Dict with keys: "rmse", "mrae", "psnr", "sam", "ssim".
+    Full reconstruction-quality metric suite (MRAE, PSNR, RMSE, SAM, SSIM)
+    for one HSI cube, computed with the same project metric functions used
+    for validation reporting. Unlike ``calculate_noise_mrae``, this compares
+    the final reconstructed HSI against the ground-truth HSI cube (used only
+    for the visualization panel captions, not for the diffusion training
+    objective).
     """
     prediction = prediction.detach().float()
     target = target.detach().float()
 
-    diff = prediction - target
-    mse = torch.mean(diff ** 2)
-    rmse = torch.sqrt(mse)
-    mrae = torch.mean(torch.abs(diff) / (torch.abs(target) + 1e-6))
-    sam = calculate_spectral_angle_mapper(prediction, target)
+    if not torch.isfinite(prediction).all():
+        raise FloatingPointError("Visualization prediction contains NaN or Inf.")
+    if not torch.isfinite(target).all():
+        raise FloatingPointError("Visualization target contains NaN or Inf.")
 
-    data_range = float((target.max() - target.min()).clamp_min(1e-8))
-    target_np = target.cpu().numpy()
-    prediction_np = prediction.cpu().numpy()
-
-    psnr = float(
-        sk_peak_signal_noise_ratio(target_np, prediction_np, data_range=data_range)
-    )
-
-    band_ssim_values = [
-        sk_structural_similarity(target_np[band], prediction_np[band], data_range=data_range)
-        for band in range(target_np.shape[0])
-    ]
-    ssim = float(np.mean(band_ssim_values))
+    # Metric functions follow the convention metric(target, prediction) and
+    # expect a batch dimension, matching their use elsewhere in the project.
+    batched_prediction = prediction.unsqueeze(0)
+    batched_target = target.unsqueeze(0)
 
     return {
-        "rmse": float(rmse),
-        "mrae": float(mrae),
-        "psnr": psnr,
-        "sam": sam,
-        "ssim": ssim,
+        "mrae": _metric_to_float(mrae(batched_target, batched_prediction), "MRAE"),
+        "psnr": _metric_to_float(psnr(batched_target, batched_prediction), "PSNR"),
+        "rmse": _metric_to_float(rmse(batched_target, batched_prediction), "RMSE"),
+        "sam": _metric_to_float(sam(batched_target, batched_prediction), "SAM"),
+        "ssim": _metric_to_float(ssim(batched_target, batched_prediction), "SSIM"),
     }
 
 
@@ -1711,7 +1704,6 @@ def run_visualization(
                 rgb_batch,
                 num_steps=NUM_SAMPLING_STEPS,
                 guidance_scale=RESTORATION_GUIDANCE_SCALE,
-                context=CONTEXT,
             )
 
         stage1_prediction = stage1_prediction[
@@ -1743,15 +1735,15 @@ def run_visualization(
 
         axes[row, 0].set_ylabel(
             f"{stem}\n"
-            f"MST++: RMSE {stage1_metrics['rmse']:.4f}, MRAE {stage1_metrics['mrae']:.4f}, "
-            f"PSNR {stage1_metrics['psnr']:.2f} dB, SAM {stage1_metrics['sam']:.2f}°, "
+            f"MST++: MRAE {stage1_metrics['mrae']:.4f}, PSNR {stage1_metrics['psnr']:.2f} dB, "
+            f"RMSE {stage1_metrics['rmse']:.4f}, SAM {stage1_metrics['sam']:.4f}, "
             f"SSIM {stage1_metrics['ssim']:.4f}\n"
-            f"DiffBIR: RMSE {refined_metrics['rmse']:.4f}, MRAE {refined_metrics['mrae']:.4f}, "
-            f"PSNR {refined_metrics['psnr']:.2f} dB, SAM {refined_metrics['sam']:.2f}°, "
+            f"DiffBIR: MRAE {refined_metrics['mrae']:.4f}, PSNR {refined_metrics['psnr']:.2f} dB, "
+            f"RMSE {refined_metrics['rmse']:.4f}, SAM {refined_metrics['sam']:.4f}, "
             f"SSIM {refined_metrics['ssim']:.4f}",
             fontsize=8,
             rotation=0,
-            labelpad=130,
+            labelpad=115,
             va="center",
         )
 
