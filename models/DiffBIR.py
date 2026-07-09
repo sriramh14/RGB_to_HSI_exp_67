@@ -122,7 +122,7 @@ except ImportError:  # pragma: no cover - fallback for standalone inspection
     MST_Plus_Plus = None
 
 try:
-    from .HSI_VAE import HSI_VAE  # pretrained HSI VAE (encoder/decoder)
+    from .HSI_VAE import HSIVAE  # pretrained HSI VAE (encoder/decoder)
 except ImportError:  # pragma: no cover
     HSIVAE = None
 
