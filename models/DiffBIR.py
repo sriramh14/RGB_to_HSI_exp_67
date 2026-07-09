@@ -19,8 +19,8 @@ Pipeline
     z_T  --[IRControlNet + frozen HSI Latent Diffusion UNet]--> z_0 (denoised latent)
     z_0  --[frozen HSI VAE Decoder]---------------->  refined HSI
 
-Faithfulness to DiffBIR
-------------------------
+Faithfulness to DiffBIR, and a note on the concrete backbone architecture
+--------------------------------------------------------------------------
 
 This file mirrors the paper's two-stage design as closely as possible:
 
@@ -30,32 +30,56 @@ This file mirrors the paper's two-stage design as closely as possible:
      trained separately, and is FROZEN here (Section 3.2 of the paper).
 
   2. Generation Module (GM, Stage II): a latent-diffusion model built on a
-     pretrained (frozen) HSI Latent Diffusion UNet, controlled by
-     "IRControlNet" (Section 3.3):
+     pretrained (frozen) HSI Latent Diffusion UNet (``HSILatentDiffusionUNet``),
+     controlled by "IRControlNet" (Section 3.3):
         a) Condition encoding: the frozen, pretrained HSI VAE encoder E
            is reused (NOT a small trained-from-scratch hint network) to
            project I_RM into the latent space: c_RM = E(I_RM).
-        b) Condition network: a TRAINABLE COPY of the UNet's encoder
-           ("input_blocks") and middle block, whose first layer is
-           zero-expanded to accept the channel-concatenation
-           z'_t = concat(z_t, c_RM).
+        b) Condition network: a TRAINABLE COPY of the UNet's encoder path
+           (its ``down_stages``) and middle blocks (``middle_block1``,
+           ``middle_attention``, ``middle_block2``), plus a copy of its
+           time embedding (``time_position`` + ``time_mlp``). Its first
+           layer (a copy of ``input_conv``) is zero-expanded to accept the
+           channel-concatenation z'_t = concat(z_t, c_RM).
         c) Feature modulation: multi-scale features from the condition
            network modulate (via addition) the frozen UNet's skip
            connections and middle-block feature, each through a
            zero-initialized 1x1 convolution ("zero convolution"), exactly
            as in ControlNet / IRControlNet.
-     Only the condition network + zero convolutions + copied time
-     embedding are trainable; the backbone UNet and the VAE are frozen
-     (Eq. 4 of the paper).
 
-  3. Region-Adaptive Restoration Guidance (Section 3.4, Eq. 5-7): a
+     IMPORTANT ARCHITECTURE NOTE: the concrete ``HSILatentDiffusionUNet``
+     provided for this project exposes a plain, unconditional forward
+     signature -- ``forward(noisy_latent, timesteps)`` -- with no
+     ``context``/``control`` hook to inject external conditioning signals
+     into (unlike the CompVis/ControlNet-style UNet this design was
+     originally sketched against). Since we cannot pass a control signal
+     through ``unet.forward()`` as a black box, ``GenerationModule`` below
+     instead RE-EXECUTES the frozen UNet's own submodules in the exact same
+     order as ``HSILatentDiffusionUNet.forward`` (its ``input_conv``,
+     ``down_stages``, ``middle_block1``/``middle_attention``/
+     ``middle_block2``, ``up_stages``, ``upsamplers``, ``output_norm``,
+     ``output_conv``), adding IRControlNet's control tensors at exactly the
+     same two injection points DiffBIR uses -- the skip connections and the
+     middle-block feature -- before they are consumed by the corresponding
+     ``up_stages``. The frozen UNet's own parameters are never modified or
+     copied-over; only the additional (trainable) control signal is added
+     to its intermediate activations. This is mechanically equivalent to
+     ControlNet's ``control=`` / ``mid_control=`` convention, just
+     implemented via direct submodule invocation instead of a forward
+     keyword argument, because the imported UNet does not expose one.
+
+     Only IRControlNet's parameters (condition network + zero convolutions
+     + copied time embedding) are trainable; the backbone UNet and the VAE
+     are frozen (Eq. 4 of the paper).
+
+  3. Region-Adaptive Restoration Guidance (Section 3.4, Eq. 5-7, 14-17): a
      training-free, gradient-descent-based guidance applied at every
      sampling step, pulling the low-frequency (flat) regions of the
      denoised prediction towards the Stage-I HSI I_RM, while leaving
-     high-frequency (textured) regions free to be generated. Adapted
-     here to multi-band HSI by averaging the Sobel gradient magnitude
-     across spectral bands before computing the patch-level gradient
-     density map (Eq. 14-17).
+     high-frequency (textured) regions free to be generated. Adapted here
+     to multi-band HSI by averaging the Sobel gradient magnitude across
+     spectral bands before computing the patch-level gradient density map
+     (Eq. 14-17).
 
 Imported (NOT reimplemented) components
 ----------------------------------------
@@ -63,49 +87,39 @@ Imported (NOT reimplemented) components
 The following are assumed to be implemented elsewhere in the user's
 codebase and are imported here. Adjust the import paths as needed.
 
-  * MST_Plus_Plus       -- Stage-I RGB -> HSI restoration backbone.
-  * HSIVAE              -- pretrained VAE with `.encode(x)` and
-                            `.decode(z)`, operating on HSI cubes
-                            (B, C_hsi, H, W) <-> latents (B, C_lat, h, w).
-  * HSILatentDiffusionUNet -- pretrained latent-diffusion UNet operating
-                            on the VAE latent space, following the
-                            standard (CompVis/ControlNet-style) UNet
-                            interface, i.e. it exposes:
-                                .time_embed        (nn.Module)
-                                .input_blocks       (nn.ModuleList of
-                                                      TimestepEmbedSequential-
-                                                      like blocks, each
-                                                      called as
-                                                      block(x, emb, context))
-                                .middle_block       (same calling convention)
-                                .output_blocks       (nn.ModuleList, mirror
-                                                      of input_blocks)
-                                .out                (final projection to
-                                                      predicted noise)
-                            and a forward signature compatible with:
-                                unet(x, timesteps, context=None,
-                                     control=None, mid_control=None)
-                            where `control` is a list of per-scale control
-                            tensors (one per skip connection, ordered to
-                            match `output_blocks`) added residually to the
-                            corresponding skip features, and `mid_control`
-                            is added to the middle-block output. This is
-                            the same convention used by the official
-                            ControlNet implementation. If your UNet's
-                            forward signature differs, adapt
-                            `GenerationModule._call_unet` below.
+  * MST_Plus_Plus            -- Stage-I RGB -> HSI restoration backbone.
+                                 Interface: ``mst(rgb) -> hsi``.
+  * HSIVAE                   -- pretrained HSI VAE. Interface:
+                                     z, mu, logvar = vae.encode(x, sample=bool)
+                                     x_hat          = vae.decode(z)
+                                 operating on HSI cubes (B, C_hsi, H, W) and
+                                 latents (B, C_lat, H/4, W/4).
+  * HSILatentDiffusionUNet   -- pretrained latent-diffusion UNet operating
+                                 on the VAE latent space. Interface:
+                                     eps_hat = unet(noisy_latent, timesteps)
+                                 and publicly exposes the submodules used
+                                 for control injection (see note above):
+                                 ``input_conv``, ``down_stages``,
+                                 ``middle_block1``, ``middle_attention``,
+                                 ``middle_block2``, ``up_stages``,
+                                 ``upsamplers``, ``output_norm``,
+                                 ``output_conv``, ``time_position``,
+                                 ``time_mlp``, plus the architecture
+                                 metadata attributes ``latent_channels``,
+                                 ``base_channels``, and
+                                 ``channel_multipliers``.
 
 If any of these imports fail (e.g. while reading this file outside of the
 target project), lightweight placeholder stubs are substituted so that the
-module can still be imported and inspected; replace `USE_STUBS = False`
-import guards with the real modules in your environment.
+module can still be imported and inspected; replace the guarded imports
+below with the real modules in your environment.
 """
 
 from __future__ import annotations
 
 import copy
 import math
-from typing import List, Optional, Sequence, Union
+from typing import List, Optional, Sequence, Tuple, Union
 
 import torch
 import torch.nn as nn
@@ -158,34 +172,11 @@ def zero_module(module: nn.Module) -> nn.Module:
     return module
 
 
-def timestep_embedding(timesteps: torch.Tensor, dim: int, max_period: int = 10000) -> torch.Tensor:
-    """
-    Standard sinusoidal timestep embeddings, as used in DDPM / Stable
-    Diffusion / ControlNet.
-
-    Args:
-        timesteps: (B,) tensor of integer / float diffusion timesteps.
-        dim: embedding dimensionality.
-    Returns:
-        (B, dim) embedding tensor.
-    """
-    half = dim // 2
-    freqs = torch.exp(
-        -math.log(max_period) * torch.arange(0, half, dtype=torch.float32, device=timesteps.device) / half
-    )
-    args = timesteps[:, None].float() * freqs[None]
-    embedding = torch.cat([torch.cos(args), torch.sin(args)], dim=-1)
-    if dim % 2:
-        embedding = torch.cat([embedding, torch.zeros_like(embedding[:, :1])], dim=-1)
-    return embedding
-
-
-def find_first_conv2d(module: nn.Module) -> Optional[nn.Conv2d]:
-    """Depth-first search for the first nn.Conv2d submodule of `module`."""
-    for m in module.modules():
-        if isinstance(m, nn.Conv2d):
-            return m
-    return None
+def make_trainable(module: nn.Module) -> nn.Module:
+    """Explicitly mark every parameter of `module` as trainable in-place."""
+    for p in module.parameters():
+        p.requires_grad_(True)
+    return module
 
 
 # ==========================================================================
@@ -195,99 +186,69 @@ def find_first_conv2d(module: nn.Module) -> Optional[nn.Conv2d]:
 class IRControlNet(nn.Module):
     """
     Faithful re-implementation of IRControlNet from the DiffBIR paper,
-    adapted for HSI latents.
+    adapted to the concrete ``HSILatentDiffusionUNet`` architecture used in
+    this project.
 
     Components (matching Fig. 4 / Section 3.3 of the paper):
       1) Condition encoding: performed OUTSIDE this module, by the frozen,
          pretrained HSI VAE encoder (see `GenerationModule.encode_condition`).
          This module only receives the resulting condition latent c_RM.
       2) Condition network F_cond: a trainable copy of the pretrained
-         UNet's encoder ("input_blocks") and middle block. It receives
+         UNet's encoder path (``down_stages``) and middle blocks
+         (``middle_block1``, ``middle_attention``, ``middle_block2``), plus
+         a trainable copy of its time embedding (``time_position`` is
+         parameter-free and copied only for structural symmetry;
+         ``time_mlp`` is a genuine trainable copy). It receives
          z'_t = concat(z_t, c_RM) along the channel axis. Because
          concatenation increases the input channel count beyond what the
-         copied first layer expects, a few extra input channels are added
-         to that first convolution and zero-initialized (Section 3.3,
-         "zero initialization" paragraph) -- this avoids random-noise
-         gradients early in training while still giving a good weight
-         initialization for the rest of the copied network.
-      3) Feature modulation: multi-scale outputs of the condition network
-         are projected through zero convolutions and later added to the
-         frozen backbone UNet's skip / middle-block features.
+         copied ``input_conv`` expects, extra input channels are added to
+         that first convolution and zero-initialized (Section 3.3, "zero
+         initialization" paragraph) -- this avoids random-noise gradients
+         early in training while still giving a good weight initialization
+         for the rest of the copied network.
+      3) Feature modulation: the skip feature produced by every
+         ``down_stage`` and the feature produced by the middle blocks are
+         each projected through a dedicated zero convolution, producing the
+         control signals that ``GenerationModule`` later adds to the frozen
+         UNet's own skip / middle-block features.
 
-    Only this module's parameters (condition network + zero convolutions +
-    copied time-embedding) are trainable; the original UNet and VAE remain
-    frozen, as required by Eq. 4 in the paper.
+    Only this module's parameters are trainable; the original UNet and VAE
+    remain frozen, as required by Eq. 4 in the paper.
     """
 
-    def __init__(
-        self,
-        unet: nn.Module,
-        latent_channels: int,
-        skip_channels: Sequence[int],
-        mid_channels: int,
-    ):
+    def __init__(self, unet: "HSILatentDiffusionUNet"):
         """
         Args:
             unet: the pretrained, frozen HSI latent diffusion UNet, used
-                only as a template to build a trainable copy of its
-                encoder path (`.input_blocks`) and `.middle_block`, and to
-                clone its `.time_embed`. `unet` itself is NOT modified or
-                stored by reference here (a deep copy is taken).
-            latent_channels: number of channels of a single VAE latent
-                (i.e. channels of z_t, and of c_RM, before concatenation).
-            skip_channels: output channel count of each `input_blocks[i]`
-                stage in `unet`, in order. Used to build one zero
-                convolution per stage (mirrors ControlNet's `zero_convs`).
-            mid_channels: output channel count of `unet.middle_block`.
+                as a template to build a trainable copy of its encoder path
+                (`.down_stages`), middle blocks, and time embedding. `unet`
+                itself is NOT modified (its submodules are deep-copied).
         """
         super().__init__()
 
-        # --- 2) Condition network: trainable copy of encoder + middle block.
-        self.time_embed = copy.deepcopy(unet.time_embed)
-        self.input_blocks = copy.deepcopy(unet.input_blocks)
-        self.middle_block = copy.deepcopy(unet.middle_block)
-
-        # Zero-expand the very first convolution to accept the
-        # channel-concatenation of z_t and c_RM instead of z_t alone.
-        self._expand_first_conv(extra_in_channels=latent_channels)
-
-        # --- 3) Feature modulation: one zero conv per input-block stage,
-        # plus one for the middle block. These map control features to the
-        # same channel dimensionality as the corresponding frozen-UNet
-        # feature (since the condition network is a structural copy of the
-        # UNet encoder, channel dims already match).
-        self.zero_convs = nn.ModuleList(
-            [zero_module(nn.Conv2d(ch, ch, kernel_size=1)) for ch in skip_channels]
+        self.latent_channels: int = unet.latent_channels
+        self.stage_channels: Tuple[int, ...] = tuple(
+            unet.base_channels * multiplier for multiplier in unet.channel_multipliers
         )
-        self.middle_block_out = zero_module(nn.Conv2d(mid_channels, mid_channels, kernel_size=1))
+        self.middle_channels: int = self.stage_channels[-1]
 
-    def _expand_first_conv(self, extra_in_channels: int) -> None:
-        """
-        Increase the input-channel count of the first Conv2d found in
-        `self.input_blocks[0]` by `extra_in_channels`, zero-initializing
-        the new weight slice. This implements the "introduce a few
-        parameters ... and initialize them to zero" step described in
-        Section 3.3 of the paper for accommodating
-        z'_t = cat(z_t, c_RM).
-        """
-        first_block = self.input_blocks[0]
-        old_conv = find_first_conv2d(first_block)
-        if old_conv is None:
-            raise RuntimeError(
-                "IRControlNet: could not locate a Conv2d layer inside "
-                "input_blocks[0] to expand for concatenated conditioning. "
-                "Adjust `_expand_first_conv` to match your UNet's architecture."
-            )
+        # --- 2) Condition network: trainable copy of encoder + middle blocks.
+        self.time_position = copy.deepcopy(unet.time_position)  # parameter-free (sinusoidal)
+        self.time_mlp = make_trainable(copy.deepcopy(unet.time_mlp))
+        self.down_stages = make_trainable(copy.deepcopy(unet.down_stages))
+        self.middle_block1 = make_trainable(copy.deepcopy(unet.middle_block1))
+        self.middle_attention = make_trainable(copy.deepcopy(unet.middle_attention))
+        self.middle_block2 = make_trainable(copy.deepcopy(unet.middle_block2))
 
-        new_in_channels = old_conv.in_channels + extra_in_channels
+        # Zero-expand the copied input convolution to accept the
+        # channel-concatenation z'_t = cat(z_t, c_RM) instead of z_t alone.
+        old_conv = unet.input_conv
         new_conv = nn.Conv2d(
-            new_in_channels,
+            old_conv.in_channels + self.latent_channels,
             old_conv.out_channels,
             kernel_size=old_conv.kernel_size,
             stride=old_conv.stride,
             padding=old_conv.padding,
-            dilation=old_conv.dilation,
-            groups=old_conv.groups,
             bias=old_conv.bias is not None,
         )
         with torch.no_grad():
@@ -295,67 +256,53 @@ class IRControlNet(nn.Module):
             new_conv.weight[:, : old_conv.in_channels] = old_conv.weight
             if old_conv.bias is not None:
                 new_conv.bias.copy_(old_conv.bias)
+        make_trainable(new_conv)
+        self.input_conv = new_conv
 
-        self._replace_submodule(first_block, old_conv, new_conv)
-
-    @staticmethod
-    def _replace_submodule(root: nn.Module, target: nn.Module, replacement: nn.Module) -> bool:
-        """Replace the first occurrence of `target` inside `root` with `replacement`."""
-        for name, child in root.named_children():
-            if child is target:
-                setattr(root, name, replacement)
-                return True
-            if IRControlNet._replace_submodule(child, target, replacement):
-                return True
-        return False
+        # --- 3) Feature modulation: one zero conv per down-stage skip
+        # connection, plus one for the middle-block feature.
+        self.zero_convs = nn.ModuleList(
+            [zero_module(nn.Conv2d(ch, ch, kernel_size=1)) for ch in self.stage_channels]
+        )
+        self.middle_zero_conv = zero_module(
+            nn.Conv2d(self.middle_channels, self.middle_channels, kernel_size=1)
+        )
 
     def forward(
         self,
         z_t: torch.Tensor,
         c_rm: torch.Tensor,
         timesteps: torch.Tensor,
-        context: Optional[torch.Tensor] = None,
-    ) -> List[torch.Tensor]:
+    ) -> Tuple[List[torch.Tensor], torch.Tensor]:
         """
         Args:
-            z_t: (B, C_lat, h, w) noisy latent at diffusion step t.
-            c_rm: (B, C_lat, h, w) condition latent, c_RM = E(I_RM).
+            z_t: (B, C_lat, H, W) noisy latent at diffusion step t.
+            c_rm: (B, C_lat, H, W) condition latent, c_RM = E(I_RM).
             timesteps: (B,) diffusion timesteps.
-            context: optional cross-attention context (e.g. empty / negative
-                text-prompt embeddings, as used in DiffBIR).
 
         Returns:
-            A list of control-signal tensors, ordered to match the frozen
-            UNet's skip connections (`output_blocks`, reversed order handled
-            by `GenerationModule._call_unet`), with the middle-block control
-            signal appended last.
+            skip_controls: list of control tensors, one per down-stage,
+                already projected through their zero convolutions, ordered
+                to match `unet.down_stages` (i.e. shallow-to-deep).
+            mid_control: the middle-block control tensor.
         """
-        z_prime = torch.cat([z_t, c_rm], dim=1)  # Eq.: z'_t = cat(z_t, c_RM)
+        z_prime = torch.cat([z_t, c_rm], dim=1)  # z'_t = cat(z_t, c_RM)
 
-        emb = self.time_embed(timestep_embedding(timesteps, self.time_embed[0].in_features)
-                               if isinstance(self.time_embed, nn.Sequential)
-                               else timestep_embedding(timesteps, self._infer_temb_dim()))
+        time_embedding = self.time_mlp(self.time_position(timesteps))
 
-        controls: List[torch.Tensor] = []
-        h = z_prime
-        for block, zero_conv in zip(self.input_blocks, self.zero_convs):
-            h = block(h, emb, context)
-            controls.append(zero_conv(h))
+        x = self.input_conv(z_prime)
 
-        h = self.middle_block(h, emb, context)
-        controls.append(self.middle_block_out(h))
-        return controls
+        skip_controls: List[torch.Tensor] = []
+        for down_stage, zero_conv in zip(self.down_stages, self.zero_convs):
+            x, skip = down_stage(x, time_embedding)
+            skip_controls.append(zero_conv(skip))
 
-    def _infer_temb_dim(self) -> int:
-        """Best-effort inference of the sinusoidal embedding input dim."""
-        first_linear = None
-        for m in self.time_embed.modules():
-            if isinstance(m, nn.Linear):
-                first_linear = m
-                break
-        if first_linear is None:
-            raise RuntimeError("IRControlNet: could not infer timestep embedding dimension.")
-        return first_linear.in_features
+        x = self.middle_block1(x, time_embedding)
+        x = self.middle_attention(x)
+        x = self.middle_block2(x, time_embedding)
+        mid_control = self.middle_zero_conv(x)
+
+        return skip_controls, mid_control
 
 
 # ==========================================================================
@@ -373,8 +320,15 @@ class GenerationModule(nn.Module):
         signals to the frozen UNet.
 
     Implements the objective of Eq. 4:
-        L_GM = E_{z_t,c,t,eps,c_RM} [ || eps - eps_theta(z_t, c, t, c_RM) ||^2 ]
+        L_GM = E_{z_t,t,eps,c_RM} [ || eps - eps_theta(z_t, t, c_RM) ||^2 ]
     where only IRControlNet's parameters are updated.
+
+    Because the concrete `HSILatentDiffusionUNet` has no `control=` hook in
+    its own `forward()`, `_unet_forward_with_control` below manually
+    re-executes its forward pass submodule-by-submodule (identical control
+    flow to `HSILatentDiffusionUNet.forward`), adding IRControlNet's control
+    tensors to the skip connections and the middle-block feature. See the
+    module-level docstring for the full rationale.
     """
 
     def __init__(self, unet: nn.Module, vae: nn.Module, control_net: IRControlNet):
@@ -383,44 +337,29 @@ class GenerationModule(nn.Module):
         self.vae = freeze_module(vae)
         self.control_net = control_net  # trainable
 
-    # ---- Condition encoding (Section 3.3, "1) condition encoding") ------
+    # ---- Condition / target encoding (Section 3.3, "1) condition encoding") ----
     @torch.no_grad()
     def encode_condition(self, i_rm: torch.Tensor) -> torch.Tensor:
         """
         Encode the Stage-I HSI estimate I_RM with the frozen, pretrained
         VAE encoder to obtain the reliable condition latent c_RM = E(I_RM).
 
-        The condition is used deterministically (VAE mode/mean, not a
-        stochastic sample) since it plays the role of a fixed, reliable
+        The condition is used deterministically (VAE posterior mode, i.e.
+        ``sample=False``) since it plays the role of a fixed, reliable
         control signal rather than a generative latent variable.
         """
-        latent = self.vae.encode(i_rm)
-        return self._latent_to_tensor(latent, deterministic=True)
+        z, _mu, _logvar = self.vae.encode(i_rm, sample=False)
+        return z
 
     @torch.no_grad()
-    def encode_target(self, hq_hsi: torch.Tensor, sample: bool = True) -> torch.Tensor:
-        """Encode a ground-truth HSI cube into the VAE latent space (for training)."""
-        latent = self.vae.encode(hq_hsi)
-        return self._latent_to_tensor(latent, deterministic=not sample)
-
-    @staticmethod
-    def _latent_to_tensor(latent: Union[torch.Tensor, object], deterministic: bool) -> torch.Tensor:
+    def encode_target(self, hq_hsi: torch.Tensor, sample: bool = False) -> torch.Tensor:
         """
-        Normalize the output of `vae.encode` to a plain tensor, supporting
-        VAEs that return either a raw tensor or a distribution-like object
-        exposing `.mode()` / `.sample()` (e.g. a diagonal Gaussian, as in
-        Stable Diffusion's AutoencoderKL).
+        Encode a ground-truth HSI cube into the VAE latent space (for
+        training). `sample=False` uses the deterministic posterior mode;
+        set `sample=True` to draw a stochastic VAE latent instead.
         """
-        if torch.is_tensor(latent):
-            return latent
-        if deterministic and hasattr(latent, "mode"):
-            return latent.mode()
-        if hasattr(latent, "sample"):
-            return latent.sample()
-        raise TypeError(
-            "HSIVAE.encode() must return a Tensor or an object exposing "
-            "`.mode()`/`.sample()`."
-        )
+        z, _mu, _logvar = self.vae.encode(hq_hsi, sample=sample)
+        return z
 
     @torch.no_grad()
     def decode(self, z: torch.Tensor) -> torch.Tensor:
@@ -430,9 +369,9 @@ class GenerationModule(nn.Module):
     def decode_grad(self, z: torch.Tensor) -> torch.Tensor:
         """
         Decode a latent with gradients enabled w.r.t. `z` (but NOT w.r.t.
-        the frozen decoder's parameters). Used by the restoration guidance
-        step, which needs d(decoded image)/d(z) but must not update the
-        decoder itself.
+        the frozen decoder's parameters, which never receive gradient
+        updates). Used by the restoration guidance step, which needs
+        d(decoded image)/d(z) but must not update the decoder itself.
         """
         return self.vae.decode(z)
 
@@ -442,40 +381,74 @@ class GenerationModule(nn.Module):
         z_t: torch.Tensor,
         timesteps: torch.Tensor,
         c_rm: torch.Tensor,
-        context: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """
-        Predict the noise eps_theta(z_t, c, t, c_RM) using the frozen UNet
+        Predict the noise eps_theta(z_t, t, c_RM) using the frozen UNet
         modulated by IRControlNet's control signals.
         """
-        controls = self.control_net(z_t, c_rm, timesteps, context)
-        mid_control = controls[-1]
-        skip_controls = controls[:-1]
-        return self._call_unet(z_t, timesteps, context, skip_controls, mid_control)
+        skip_controls, mid_control = self.control_net(z_t, c_rm, timesteps)
+        return self._unet_forward_with_control(z_t, timesteps, skip_controls, mid_control)
 
-    def _call_unet(
+    def _unet_forward_with_control(
         self,
         z_t: torch.Tensor,
         timesteps: torch.Tensor,
-        context: Optional[torch.Tensor],
         skip_controls: List[torch.Tensor],
         mid_control: torch.Tensor,
     ) -> torch.Tensor:
         """
-        Invoke the frozen backbone UNet with the ControlNet-style
-        `control` / `mid_control` keyword arguments. If your imported
-        `HSILatentDiffusionUNet` uses a different signature, adapt this
-        method only (the rest of the pipeline is architecture-agnostic).
+        Re-execute the frozen `HSILatentDiffusionUNet`'s forward pass,
+        submodule by submodule, injecting IRControlNet's control tensors
+        into the skip connections (before they reach `up_stages`) and into
+        the middle-block feature -- the same two injection points used by
+        DiffBIR / ControlNet. Mirrors `HSILatentDiffusionUNet.forward`
+        exactly, aside from these additions.
         """
-        try:
-            return self.unet(
-                z_t, timesteps, context=context, control=skip_controls, mid_control=mid_control
-            )
-        except TypeError:
-            # Fallback for UNets that accept a single combined control list
-            # (skip controls followed by the mid control), a common
-            # alternative convention.
-            return self.unet(z_t, timesteps, context=context, control=skip_controls + [mid_control])
+        unet = self.unet
+
+        if z_t.ndim != 4:
+            raise ValueError(f"z_t must have shape [B, C, H, W], got {tuple(z_t.shape)}.")
+
+        batch_size = z_t.shape[0]
+        if not torch.is_tensor(timesteps):
+            timesteps = torch.tensor(timesteps, device=z_t.device)
+        timesteps = timesteps.to(z_t.device)
+        if timesteps.ndim == 0:
+            timesteps = timesteps.repeat(batch_size)
+        elif timesteps.numel() == 1 and batch_size > 1:
+            timesteps = timesteps.reshape(1).repeat(batch_size)
+        else:
+            timesteps = timesteps.reshape(-1)
+
+        time_embedding = unet.time_position(timesteps)
+        time_embedding = unet.time_mlp(time_embedding)
+
+        x = unet.input_conv(z_t)
+
+        skips: List[torch.Tensor] = []
+        for down_stage, control in zip(unet.down_stages, skip_controls):
+            x, skip = down_stage(x, time_embedding)
+            skips.append(skip + control)  # feature modulation: skip connection
+
+        x = unet.middle_block1(x, time_embedding)
+        x = unet.middle_attention(x)
+        x = unet.middle_block2(x, time_embedding)
+        x = x + mid_control  # feature modulation: middle-block feature
+
+        upsample_index = 0
+        for stage_index, up_stage in enumerate(unet.up_stages):
+            skip = skips.pop()
+            x = up_stage(x, skip, time_embedding)
+
+            is_last_up_stage = stage_index == len(unet.up_stages) - 1
+            if not is_last_up_stage:
+                next_skip = skips[-1]
+                x = unet.upsamplers[upsample_index](x, target_size=next_skip.shape[-2:])
+                upsample_index += 1
+
+        x = unet.output_norm(x)
+        x = F.silu(x)
+        return unet.output_conv(x)
 
 
 # ==========================================================================
@@ -585,7 +558,7 @@ class RegionAdaptiveRestorationGuidance:
             z0'_tilde = z0_tilde - s * grad_{z0_tilde} L(z0_tilde)
 
         Args:
-            z0_tilde: (B, C_lat, h, w) predicted clean latent at the
+            z0_tilde: (B, C_lat, H, W) predicted clean latent at the
                 current sampling step (no grad required on input).
             decode_fn: callable mapping a latent tensor to HSI pixel space
                 (typically `GenerationModule.decode_grad`); gradients are
@@ -769,6 +742,12 @@ class DiffBIRHSI(nn.Module):
       * `generate`            - full inference-time sampling loop with
                                  optional region-adaptive restoration
                                  guidance (Eq. 5-7).
+
+    Note: `latent_channels`, the per-stage skip-connection channel counts,
+    and the middle-block channel count are all inferred automatically from
+    the supplied `unet` (via its `latent_channels`, `base_channels`, and
+    `channel_multipliers` attributes) -- no architecture metadata needs to
+    be passed in manually.
     """
 
     def __init__(
@@ -776,21 +755,13 @@ class DiffBIRHSI(nn.Module):
         stage1_rm: nn.Module,
         vae: nn.Module,
         unet: nn.Module,
-        latent_channels: int,
-        skip_channels: Sequence[int],
-        mid_channels: int,
         num_train_timesteps: int = 1000,
         patch_size: int = 8,
     ):
         super().__init__()
         self.stage1 = RestorationModuleStage1(stage1_rm)
 
-        control_net = IRControlNet(
-            unet=unet,
-            latent_channels=latent_channels,
-            skip_channels=skip_channels,
-            mid_channels=mid_channels,
-        )
+        control_net = IRControlNet(unet=unet)
         self.generation = GenerationModule(unet=unet, vae=vae, control_net=control_net)
 
         self.scheduler = GaussianDiffusionScheduler(num_train_timesteps=num_train_timesteps)
@@ -809,22 +780,14 @@ class DiffBIRHSI(nn.Module):
         return self.stage1(rgb)
 
     # ---- Stage II: training -----------------------------------------
-    def training_loss(
-        self,
-        rgb: torch.Tensor,
-        hq_hsi: torch.Tensor,
-        context: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
+    def training_loss(self, rgb: torch.Tensor, hq_hsi: torch.Tensor) -> torch.Tensor:
         """
         Compute the IRControlNet training objective (Eq. 4):
-            L_GM = E[|| eps - eps_theta(z_t, c, t, c_RM) ||^2]
+            L_GM = E[|| eps - eps_theta(z_t, t, c_RM) ||^2]
 
         Args:
             rgb: (B, 3, H, W) degraded RGB input.
             hq_hsi: (B, C_hsi, H, W) ground-truth high-quality HSI.
-            context: optional cross-attention conditioning (e.g. an empty
-                / fixed text-prompt embedding, matching DiffBIR's use of
-                an empty positive prompt).
 
         Returns:
             Scalar training loss.
@@ -838,7 +801,7 @@ class DiffBIRHSI(nn.Module):
         noise = torch.randn_like(z0)
         z_t = self.scheduler.q_sample(z0, t, noise)
 
-        eps_pred = self.generation(z_t, t, c_rm, context=context)
+        eps_pred = self.generation(z_t, t, c_rm)
         return F.mse_loss(eps_pred, noise)
 
     # ---- Stage II: inference / sampling ------------------------------
@@ -848,7 +811,6 @@ class DiffBIRHSI(nn.Module):
         rgb: torch.Tensor,
         num_steps: int = 50,
         guidance_scale: float = 0.0,
-        context: Optional[torch.Tensor] = None,
         latent_shape: Optional[Sequence[int]] = None,
     ) -> torch.Tensor:
         """
@@ -864,9 +826,8 @@ class DiffBIRHSI(nn.Module):
                 the Stage-I estimate I_RM; the paper recommends s=0.5 for
                 a balanced trade-off, and s=0 for best perceptual quality
                 on real-world data.
-            context: optional cross-attention conditioning.
             latent_shape: override for the sampled latent's spatial shape
-                (B, C_lat, h, w); inferred from `c_rm`'s shape if omitted.
+                (B, C_lat, H, W); inferred from `c_rm`'s shape if omitted.
 
         Returns:
             (B, C_hsi, H, W) refined HSI reconstruction.
@@ -886,7 +847,7 @@ class DiffBIRHSI(nn.Module):
         for step_t in timesteps:
             t_batch = torch.full((shape[0],), step_t, device=device, dtype=torch.long)
 
-            eps = self.generation(z_t, t_batch, c_rm, context=context)
+            eps = self.generation(z_t, t_batch, c_rm)
             z0_tilde = self.scheduler.predict_start_from_noise(z_t, t_batch, eps)
 
             if guidance_scale > 0:
@@ -914,9 +875,9 @@ def build_diffbir_hsi(
     mst_plus_plus_ckpt: Optional[str],
     vae_ckpt: Optional[str],
     unet_ckpt: Optional[str],
-    latent_channels: int,
-    skip_channels: Sequence[int],
-    mid_channels: int,
+    mst_kwargs: Optional[dict] = None,
+    vae_kwargs: Optional[dict] = None,
+    unet_kwargs: Optional[dict] = None,
     num_train_timesteps: int = 1000,
     patch_size: int = 8,
     device: Union[str, torch.device] = "cuda",
@@ -932,8 +893,9 @@ def build_diffbir_hsi(
             use a randomly-initialized model, e.g. for architecture tests).
         vae_ckpt: path to pretrained HSI VAE weights.
         unet_ckpt: path to pretrained HSI latent diffusion UNet weights.
-        latent_channels, skip_channels, mid_channels: architecture
-            metadata needed by `IRControlNet` (see its docstring).
+        mst_kwargs, vae_kwargs, unet_kwargs: constructor kwargs for each
+            component (e.g. `vae_kwargs={"hsi_channels": 31,
+            "latent_channels": 16, ...}`).
         num_train_timesteps: diffusion schedule length used at training
             time (must match the checkpoint the UNet was trained with).
         patch_size: patch size for the region-adaptive gradient density
@@ -951,15 +913,15 @@ def build_diffbir_hsi(
             "model.py to point to your existing implementations."
         )
 
-    mst = MST_Plus_Plus()
+    mst = MST_Plus_Plus(**(mst_kwargs or {}))
     if mst_plus_plus_ckpt is not None:
         mst.load_state_dict(torch.load(mst_plus_plus_ckpt, map_location="cpu"))
 
-    vae = HSIVAE()
+    vae = HSIVAE(**(vae_kwargs or {}))
     if vae_ckpt is not None:
         vae.load_state_dict(torch.load(vae_ckpt, map_location="cpu"))
 
-    unet = HSILatentDiffusionUNet()
+    unet = HSILatentDiffusionUNet(**(unet_kwargs or {}))
     if unet_ckpt is not None:
         unet.load_state_dict(torch.load(unet_ckpt, map_location="cpu"))
 
@@ -967,9 +929,6 @@ def build_diffbir_hsi(
         stage1_rm=mst,
         vae=vae,
         unet=unet,
-        latent_channels=latent_channels,
-        skip_channels=skip_channels,
-        mid_channels=mid_channels,
         num_train_timesteps=num_train_timesteps,
         patch_size=patch_size,
     )
