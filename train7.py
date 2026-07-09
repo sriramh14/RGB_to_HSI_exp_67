@@ -1,7 +1,4 @@
-from models.DiffBIR import DiffBIRHSI
-from models.Unet_hsi import HSILatentDiffusionUNet
-from models.HSI_VAE import HSIVAE
-from models.MST_Plus_Plus import MST_Plus_Plus
+
 """Train and visualize a DiffBIR-style HSI refinement model on paired RGB/HSI data.
 
 The trainable model is imported from ``model`` (see ``model.py``). Its frozen
@@ -59,7 +56,10 @@ from torch.utils.data import DataLoader, Dataset
 # wrapper, HSI VAE, HSI latent diffusion UNet, IRControlNet, the generation
 # module, the diffusion scheduler, and the region-adaptive restoration
 # guidance) are imported from there -- none are redefined here.
-
+from models.DiffBIR import DiffBIRHSI
+from models.Unet_hsi import HSILatentDiffusionUNet
+from models.HSI_VAE import HSIVAE
+from models.MST_Plus_Plus import MST_Plus_Plus
 # Project metric import. MRAE is defined in its own file, matching the
 # convention metric(target, prediction) used elsewhere in the project.
 from loss.mrae import mrae
