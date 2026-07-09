@@ -119,6 +119,7 @@ from __future__ import annotations
 
 import copy
 import math
+from contextlib import nullcontext
 from typing import List, Optional, Sequence, Tuple, Union
 
 import torch
@@ -177,6 +178,32 @@ def make_trainable(module: nn.Module) -> nn.Module:
     for p in module.parameters():
         p.requires_grad_(True)
     return module
+
+
+def _disable_autocast(device: torch.device):
+    """
+    Context manager that forces full-precision (float32) execution,
+    overriding any ambient `torch.autocast` context.
+
+    Used around two categories of computation in this file:
+      1. Frozen submodules (Stage-I MST++, the HSI VAE encoder/decoder)
+         that receive no gradient updates and therefore gain no benefit
+         from mixed precision.
+      2. Grouped / depth-wise convolutions (e.g. MST++'s positional
+         embedding block, and the per-band Sobel filter used by
+         `RegionAdaptiveRestorationGuidance`), which can trigger a
+         "GET was unable to find an engine to execute this computation"
+         cuDNN error on some GPU/cuDNN combinations when executed under
+         reduced-precision autocast. Running these in float32 sidesteps
+         the issue entirely.
+
+    The trainable IRControlNet + control-modulated UNet forward pass is
+    deliberately NOT wrapped with this helper, so it still benefits from
+    whatever ambient autocast context the training script sets up.
+    """
+    if device.type == "cuda":
+        return torch.autocast(device_type="cuda", enabled=False)
+    return nullcontext()
 
 
 # ==========================================================================
@@ -348,7 +375,8 @@ class GenerationModule(nn.Module):
         ``sample=False``) since it plays the role of a fixed, reliable
         control signal rather than a generative latent variable.
         """
-        z, _mu, _logvar = self.vae.encode(i_rm, sample=False)
+        with _disable_autocast(i_rm.device):
+            z, _mu, _logvar = self.vae.encode(i_rm.float(), sample=False)
         return z
 
     @torch.no_grad()
@@ -358,13 +386,15 @@ class GenerationModule(nn.Module):
         training). `sample=False` uses the deterministic posterior mode;
         set `sample=True` to draw a stochastic VAE latent instead.
         """
-        z, _mu, _logvar = self.vae.encode(hq_hsi, sample=sample)
+        with _disable_autocast(hq_hsi.device):
+            z, _mu, _logvar = self.vae.encode(hq_hsi.float(), sample=sample)
         return z
 
     @torch.no_grad()
     def decode(self, z: torch.Tensor) -> torch.Tensor:
         """Decode a latent back into HSI (pixel) space with the frozen VAE decoder."""
-        return self.vae.decode(z)
+        with _disable_autocast(z.device):
+            return self.vae.decode(z.float())
 
     def decode_grad(self, z: torch.Tensor) -> torch.Tensor:
         """
@@ -373,7 +403,8 @@ class GenerationModule(nn.Module):
         updates). Used by the restoration guidance step, which needs
         d(decoded image)/d(z) but must not update the decoder itself.
         """
-        return self.vae.decode(z)
+        with _disable_autocast(z.device):
+            return self.vae.decode(z.float())
 
     # ---- Noise prediction --------------------------------------------
     def forward(
@@ -492,10 +523,12 @@ class RegionAdaptiveRestorationGuidance:
             (B, 1, H, W) gradient magnitude map, averaged across bands.
         """
         b, c, h, w = x.shape
+        x = x.float()
         kx = self._kx.to(device=x.device, dtype=x.dtype).expand(c, 1, 3, 3)
         ky = self._ky.to(device=x.device, dtype=x.dtype).expand(c, 1, 3, 3)
-        gx = F.conv2d(x, kx, padding=1, groups=c)
-        gy = F.conv2d(x, ky, padding=1, groups=c)
+        with _disable_autocast(x.device):
+            gx = F.conv2d(x, kx, padding=1, groups=c)
+            gy = F.conv2d(x, ky, padding=1, groups=c)
         mag = torch.sqrt(gx.pow(2) + gy.pow(2) + 1e-12)  # (B, C, H, W)
         return mag.mean(dim=1, keepdim=True)  # (B, 1, H, W)
 
@@ -717,7 +750,13 @@ class RestorationModuleStage1(nn.Module):
         Returns:
             (B, C_hsi, H, W) coarse restored HSI estimate I_RM.
         """
-        return self.model(rgb)
+        # Run in full precision regardless of any ambient autocast context:
+        # MST++ is frozen (no gradient updates, so no AMP speed benefit),
+        # and some of its layers use grouped/depth-wise convolutions that
+        # can otherwise trigger a cuDNN "unable to find an engine" error
+        # under reduced-precision autocast on certain GPUs.
+        with _disable_autocast(rgb.device):
+            return self.model(rgb.float())
 
 
 # ==========================================================================
