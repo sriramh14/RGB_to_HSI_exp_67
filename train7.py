@@ -52,7 +52,10 @@ from torch.utils.data import DataLoader, Dataset
 # wrapper, HSI VAE, HSI latent diffusion UNet, IRControlNet, the generation
 # module, the diffusion scheduler, and the region-adaptive restoration
 # guidance) are imported from there -- none are redefined here.
-from models. import DiffBIRHSI, HSILatentDiffusionUNet, HSIVAE, MST_Plus_Plus
+from models.DiffBIR import DiffBIRHSI
+from models.Unet_hsi import HSILatentDiffusionUNet
+from models.HSI_VAE import HSIVAE
+from models.MST_Plus_Plus import MST_Plus_Plus
 
 # Project metric import. MRAE is defined in its own file, matching the
 # convention metric(target, prediction) used elsewhere in the project.
@@ -133,8 +136,8 @@ MODEL_DOWNSAMPLE_FACTOR = 8
 
 BATCH_SIZE = 2
 VALIDATION_BATCH_SIZE = 2
-NUM_EPOCHS = 35
-LEARNING_RATE = 5e-5
+NUM_EPOCHS = 10
+LEARNING_RATE = 1e-4
 WEIGHT_DECAY = 1e-4
 MIN_LEARNING_RATE = 1e-7
 GRADIENT_CLIP_NORM = 1.0
